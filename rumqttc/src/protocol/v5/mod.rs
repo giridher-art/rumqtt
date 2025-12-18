@@ -1,70 +1,21 @@
-//! # mqttbytes
-//!
-//! This module contains the low level struct definitions required to assemble and disassemble MQTT 3.1.1 packets in rumqttc.
-//! The [`bytes`](https://docs.rs/bytes) crate is used internally.
-
-use bytes::{Buf, BufMut, Bytes, BytesMut};
-use core::fmt;
 use std::slice::Iter;
 
-mod topic;
-pub mod v4;
+use super::*;
+use bytes::{Buf, BufMut, Bytes, BytesMut};
 
-pub use topic::*;
-
-/// Error during serialization and deserialization
-#[derive(Debug, thiserror::Error)]
-pub enum Error {
-    #[error("Expected Connect, received: {0:?}")]
-    NotConnect(PacketType),
-    #[error("Unexpected Connect")]
-    UnexpectedConnect,
-    #[error("Invalid Connect return code: {0}")]
-    InvalidConnectReturnCode(u8),
-    #[error("Invalid protocol")]
-    InvalidProtocol,
-    #[error("Invalid protocol level: {0}")]
-    InvalidProtocolLevel(u8),
-    #[error("Incorrect packet format")]
-    IncorrectPacketFormat,
-    #[error("Invalid packet type: {0}")]
-    InvalidPacketType(u8),
-    #[error("Invalid property type: {0}")]
-    InvalidPropertyType(u8),
-    #[error("Invalid QoS level: {0}")]
-    InvalidQoS(u8),
-    #[error("Invalid subscribe reason code: {0}")]
-    InvalidSubscribeReasonCode(u8),
-    #[error("Packet id Zero")]
-    PacketIdZero,
-    #[error("Payload size is incorrect")]
-    PayloadSizeIncorrect,
-    #[error("payload is too long")]
-    PayloadTooLong,
-    #[error("payload size limit exceeded: {0}")]
-    PayloadSizeLimitExceeded(usize),
-    #[error("Payload required")]
-    PayloadRequired,
-    #[error("Topic is not UTF-8")]
-    TopicNotUtf8,
-    #[error("Promised boundary crossed: {0}")]
-    BoundaryCrossed(usize),
-    #[error("Malformed packet")]
-    MalformedPacket,
-    #[error("Malformed remaining length")]
-    MalformedRemainingLength,
-    #[error("A Subscribe packet must contain atleast one filter")]
-    EmptySubscription,
-    /// More bytes required to frame packet. Argument
-    /// implies minimum additional bytes required to
-    /// proceed further
-    #[error("At least {0} more bytes required to frame packet")]
-    InsufficientBytes(usize),
-    #[error("IO: {0}")]
-    Io(#[from] std::io::Error),
-    #[error("Cannot send packet of size '{pkt_size:?}'. It's greater than the broker's maximum packet size of: '{max:?}'")]
-    OutgoingPacketTooLarge { pkt_size: usize, max: usize },
-}
+mod connack;
+mod connect;
+mod disconnect;
+mod ping;
+mod puback;
+mod pubcomp;
+mod publish;
+mod pubrec;
+mod pubrel;
+mod suback;
+mod subscribe;
+mod unsuback;
+mod unsubscribe;
 
 /// MQTT packet type
 #[repr(u8)]
@@ -86,25 +37,41 @@ pub enum PacketType {
     Disconnect,
 }
 
-/// Protocol type
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Protocol {
-    V4,
-    V5,
-}
-
-/// Quality of service
 #[repr(u8)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd)]
-pub enum QoS {
-    AtMostOnce = 0,
-    AtLeastOnce = 1,
-    ExactlyOnce = 2,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PropertyType {
+    PayloadFormatIndicator = 1,
+    MessageExpiryInterval = 2,
+    ContentType = 3,
+    ResponseTopic = 8,
+    CorrelationData = 9,
+    SubscriptionIdentifier = 11,
+    SessionExpiryInterval = 17,
+    AssignedClientIdentifier = 18,
+    ServerKeepAlive = 19,
+    AuthenticationMethod = 21,
+    AuthenticationData = 22,
+    RequestProblemInformation = 23,
+    WillDelayInterval = 24,
+    RequestResponseInformation = 25,
+    ResponseInformation = 26,
+    ServerReference = 28,
+    ReasonString = 31,
+    ReceiveMaximum = 33,
+    TopicAliasMaximum = 34,
+    TopicAlias = 35,
+    MaximumQos = 36,
+    RetainAvailable = 37,
+    UserProperty = 38,
+    MaximumPacketSize = 39,
+    WildcardSubscriptionAvailable = 40,
+    SubscriptionIdentifierAvailable = 41,
+    SharedSubscriptionAvailable = 42,
 }
 
 /// Packet type from a byte
 ///
-/// ```text
+/// ```ignore
 ///          7                          3                          0
 ///          +--------------------------+--------------------------+
 /// byte 1   | MQTT Control Packet Type | Flags for each type      |
@@ -163,6 +130,41 @@ impl FixedHeader {
     pub fn frame_length(&self) -> usize {
         self.fixed_header_len + self.remaining_len
     }
+}
+
+fn property(num: u8) -> Result<PropertyType, Error> {
+    let property = match num {
+        1 => PropertyType::PayloadFormatIndicator,
+        2 => PropertyType::MessageExpiryInterval,
+        3 => PropertyType::ContentType,
+        8 => PropertyType::ResponseTopic,
+        9 => PropertyType::CorrelationData,
+        11 => PropertyType::SubscriptionIdentifier,
+        17 => PropertyType::SessionExpiryInterval,
+        18 => PropertyType::AssignedClientIdentifier,
+        19 => PropertyType::ServerKeepAlive,
+        21 => PropertyType::AuthenticationMethod,
+        22 => PropertyType::AuthenticationData,
+        23 => PropertyType::RequestProblemInformation,
+        24 => PropertyType::WillDelayInterval,
+        25 => PropertyType::RequestResponseInformation,
+        26 => PropertyType::ResponseInformation,
+        28 => PropertyType::ServerReference,
+        31 => PropertyType::ReasonString,
+        33 => PropertyType::ReceiveMaximum,
+        34 => PropertyType::TopicAliasMaximum,
+        35 => PropertyType::TopicAlias,
+        36 => PropertyType::MaximumQos,
+        37 => PropertyType::RetainAvailable,
+        38 => PropertyType::UserProperty,
+        39 => PropertyType::MaximumPacketSize,
+        40 => PropertyType::WildcardSubscriptionAvailable,
+        41 => PropertyType::SubscriptionIdentifierAvailable,
+        42 => PropertyType::SharedSubscriptionAvailable,
+        num => return Err(Error::InvalidPropertyType(num)),
+    };
+
+    Ok(property)
 }
 
 /// Checks if the stream has enough bytes to frame a packet and returns fixed header
@@ -308,13 +310,16 @@ fn write_remaining_length(stream: &mut BytesMut, len: usize) -> Result<usize, Er
     Ok(count)
 }
 
-/// Maps a number to QoS
-pub fn qos(num: u8) -> Result<QoS, Error> {
-    match num {
-        0 => Ok(QoS::AtMostOnce),
-        1 => Ok(QoS::AtLeastOnce),
-        2 => Ok(QoS::ExactlyOnce),
-        qos => Err(Error::InvalidQoS(qos)),
+/// Return number of remaining length bytes required for encoding length
+fn len_len(len: usize) -> usize {
+    if len >= 2_097_152 {
+        4
+    } else if len >= 16_384 {
+        3
+    } else if len >= 128 {
+        2
+    } else {
+        1
     }
 }
 
@@ -337,4 +342,119 @@ fn read_u8(stream: &mut Bytes) -> Result<u8, Error> {
     }
 
     Ok(stream.get_u8())
+}
+
+fn read_u32(stream: &mut Bytes) -> Result<u32, Error> {
+    if stream.len() < 4 {
+        return Err(Error::MalformedPacket);
+    }
+
+    Ok(stream.get_u32())
+}
+
+#[derive(Debug, Copy, Clone)]
+pub struct V5;
+
+impl Protocol for V5 {
+    /// Reads a stream of bytes and extracts next MQTT packet out of it
+    fn read_mut(&mut self, stream: &mut BytesMut, max_size: usize) -> Result<Packet, Error> {
+        let fixed_header = check(stream.iter(), max_size)?;
+        let frame_length = fixed_header.frame_length();
+
+        // Test with a stream with exactly the size to check border panics
+        let packet = Bytes::copy_from_slice(&stream[..frame_length]);
+        stream.advance(frame_length);
+
+        let packet_type = fixed_header.packet_type()?;
+
+        if fixed_header.remaining_len == 0 {
+            // no payload packets
+            return match packet_type {
+                PacketType::PingReq => Ok(Packet::PingReq(PingReq)),
+                PacketType::PingResp => Ok(Packet::PingResp(PingResp)),
+                PacketType::Disconnect => Ok(Packet::Disconnect(
+                    Disconnect {
+                        reason_code: DisconnectReasonCode::NormalDisconnection,
+                    },
+                    None,
+                )),
+                _ => Err(Error::PayloadRequired),
+            };
+        }
+
+        let packet = match packet_type {
+            PacketType::Connect => {
+                let (connect, properties, will, willproperties, login) =
+                    connect::read(fixed_header, packet)?;
+                Packet::Connect(connect, properties, will, willproperties, login)
+            }
+            PacketType::Publish => {
+                let (publish, properties) = publish::read(fixed_header, packet)?;
+                Packet::Publish(publish, properties)
+            }
+            PacketType::PubAck => {
+                let (puback, properties) = puback::read(fixed_header, packet)?;
+                Packet::PubAck(puback, properties)
+            }
+            PacketType::Subscribe => {
+                let (subscribe, properties) = subscribe::read(fixed_header, packet)?;
+                Packet::Subscribe(subscribe, properties)
+            }
+            PacketType::SubAck => {
+                let (suback, properties) = suback::read(fixed_header, packet)?;
+                Packet::SubAck(suback, properties)
+            }
+            PacketType::PingReq => Packet::PingReq(PingReq),
+            PacketType::PingResp => Packet::PingResp(PingResp),
+            PacketType::Disconnect => {
+                let (disconnect, properties) = disconnect::read(fixed_header, packet)?;
+                Packet::Disconnect(disconnect, properties)
+            }
+            _ => unreachable!(),
+        };
+
+        Ok(packet)
+    }
+
+    fn write(&self, packet: Packet, buffer: &mut BytesMut) -> Result<usize, Error> {
+        let size = match packet {
+            Packet::Connect(
+                connect,
+                connect_properties,
+                last_will,
+                last_will_properties,
+                login,
+            ) => connect::write(
+                &connect,
+                &connect_properties,
+                &last_will,
+                &last_will_properties,
+                &login,
+                buffer,
+            )?,
+            Packet::ConnAck(connack, properties) => connack::write(&connack, &properties, buffer)?,
+            Packet::Publish(publish, properties) => publish::write(&publish, &properties, buffer)?,
+            Packet::PubAck(puback, properties) => puback::write(&puback, &properties, buffer)?,
+            Packet::Subscribe(subscribe, properties) => {
+                subscribe::write(&subscribe, &properties, buffer)?
+            }
+            Packet::SubAck(suback, properties) => suback::write(&suback, &properties, buffer)?,
+            Packet::PubRec(pubrec, properties) => pubrec::write(&pubrec, &properties, buffer)?,
+            Packet::PubRel(pubrel, properties) => pubrel::write(&pubrel, &properties, buffer)?,
+            Packet::PubComp(pubcomp, properties) => pubcomp::write(&pubcomp, &properties, buffer)?,
+            Packet::Unsubscribe(unsubscribe, properties) => {
+                unsubscribe::write(&unsubscribe, &properties, buffer)?
+            }
+            Packet::UnsubAck(unsuback, properties) => {
+                unsuback::write(&unsuback, &properties, buffer)?
+            }
+            Packet::Disconnect(disconnect, properties) => {
+                disconnect::write(&disconnect, &properties, buffer)?
+            }
+            Packet::PingReq(pingreq) => ping::pingreq::write(buffer)?,
+            Packet::PingResp(pingresp) => ping::pingresp::write(buffer)?,
+            _ => unreachable!(),
+        };
+        Ok(size)
+    }
 }

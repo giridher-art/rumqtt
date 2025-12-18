@@ -104,121 +104,188 @@ use std::fmt::{self, Debug, Formatter};
 use std::sync::Arc;
 
 use std::time::Duration;
-
 mod client;
+mod connection;
 mod eventloop;
-mod framed;
-pub mod mqttbytes;
+mod events;
+mod message;
+mod protocol;
 mod state;
-pub mod v5;
+mod xchg;
+// mod state;
+// pub mod v5;
 
-#[cfg(any(feature = "use-rustls-no-provider", feature = "use-native-tls"))]
-mod tls;
+// #[cfg(any(feature = "use-rustls-no-provider", feature = "use-native-tls"))]
+// mod tls;
 
-#[cfg(feature = "websocket")]
-mod websockets;
+// #[cfg(feature = "websocket")]
+// mod websockets;
 
-#[cfg(feature = "websocket")]
-use std::{
-    future::{Future, IntoFuture},
-    pin::Pin,
-};
+// #[cfg(feature = "websocket")]
+// use std::{
+//     future::{Future, IntoFuture},
+//     pin::Pin,
+// };
 
-#[cfg(feature = "websocket")]
-type RequestModifierFn = Arc<
-    dyn Fn(http::Request<()>) -> Pin<Box<dyn Future<Output = http::Request<()>> + Send>>
-        + Send
-        + Sync,
->;
+// #[cfg(feature = "websocket")]
+// type RequestModifierFn = Arc<
+//     dyn Fn(http::Request<()>) -> Pin<Box<dyn Future<Output = http::Request<()>> + Send>>
+//         + Send
+//         + Sync,
+// >;
 
-#[cfg(feature = "proxy")]
-mod proxy;
+// #[cfg(feature = "proxy")]
+// mod proxy;
 
-pub use client::{
-    AsyncClient, Client, ClientError, Connection, Iter, RecvError, RecvTimeoutError, TryRecvError,
-};
-pub use eventloop::{ConnectionError, Event, EventLoop};
-pub use mqttbytes::v4::*;
-pub use mqttbytes::*;
-#[cfg(feature = "use-rustls-no-provider")]
-use rustls_native_certs::load_native_certs;
-pub use state::{MqttState, StateError};
-#[cfg(any(feature = "use-rustls-no-provider", feature = "use-native-tls"))]
-pub use tls::Error as TlsError;
-#[cfg(feature = "use-native-tls")]
-pub use tokio_native_tls;
-#[cfg(feature = "use-native-tls")]
-use tokio_native_tls::native_tls::TlsConnector;
-#[cfg(feature = "use-rustls-no-provider")]
-pub use tokio_rustls;
-#[cfg(feature = "use-rustls-no-provider")]
-use tokio_rustls::rustls::{ClientConfig, RootCertStore};
+// #[cfg(feature = "use-rustls-no-provider")]
+// use rustls_native_certs::load_native_certs;
+// #[cfg(any(feature = "use-rustls-no-provider", feature = "use-native-tls"))]
+// pub use tls::Error as TlsError;
+// #[cfg(feature = "use-native-tls")]
+// pub use tokio_native_tls;
+// #[cfg(feature = "use-native-tls")]
+// use tokio_native_tls::native_tls::TlsConnector;
+// #[cfg(feature = "use-rustls-no-provider")]
+// pub use tokio_rustls;
+// #[cfg(feature = "use-rustls-no-provider")]
+// use tokio_rustls::rustls::{ClientConfig, RootCertStore};
 
-#[cfg(feature = "proxy")]
-pub use proxy::{Proxy, ProxyAuth, ProxyType};
+// #[cfg(feature = "proxy")]
+// pub use proxy::{Proxy, ProxyAuth, ProxyType};
 
 pub type Incoming = Packet;
 
-/// Current outgoing activity on the eventloop
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Outgoing {
-    /// Publish packet with packet identifier. 0 implies QoS 0
-    Publish(u16),
-    /// Subscribe packet with packet identifier
-    Subscribe(u16),
-    /// Unsubscribe packet with packet identifier
-    Unsubscribe(u16),
-    /// PubAck packet
-    PubAck(u16),
-    /// PubRec packet
-    PubRec(u16),
-    /// PubRel packet
-    PubRel(u16),
-    /// PubComp packet
-    PubComp(u16),
-    /// Ping request packet
-    PingReq,
-    /// Ping response packet
-    PingResp,
-    /// Disconnect packet
-    Disconnect,
-    /// Await for an ack for more outgoing progress
-    AwaitAck(u16),
+use std::{marker::PhantomData, thread};
+
+use flume::Sender;
+
+pub use crate::{
+    client::{AsyncMode, Client, SyncMode},
+    eventloop::Eventloop,
+    events::{EventsRx, EventsTx},
+    protocol::{Protocol, v4::V4},
+    state::v4::MqttState,
+};
+
+pub use message::*;
+
+#[derive(Debug)]
+pub struct ClientState {
+    id: usize,
+    acks_channel: Sender<Message>,
+    subcription_channel: Sender<Publish>,
+    subcs: Vec<usize>,
 }
 
-/// Requests by the client to mqtt event loop. Request are
-/// handled one by one.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Request {
-    Publish(Publish),
-    PubAck(PubAck),
-    PubRec(PubRec),
-    PubComp(PubComp),
-    PubRel(PubRel),
-    PingReq(PingReq),
-    PingResp(PingResp),
-    Subscribe(Subscribe),
-    SubAck(SubAck),
-    Unsubscribe(Unsubscribe),
-    UnsubAck(UnsubAck),
-    Disconnect(Disconnect),
+#[derive(Debug)]
+pub enum Control {
+    Terminate,
+    CleanupAck,
+    Stats,
 }
 
-impl From<Publish> for Request {
-    fn from(publish: Publish) -> Request {
-        Request::Publish(publish)
+// used to let cleanup method know
+// how to perform the cleanup
+pub enum CleanupMethod {
+    // do normal cleanup
+    Graceful,
+    // timed-out, no need for cleanup
+    Terminate,
+}
+
+// Represents all the IO/EventLoop events
+#[derive(Debug)]
+pub enum IOEvent {
+    // Connection data
+    ConnectionData,
+
+    // keep_alive
+    Refresh,
+
+    // Outgoing ack
+    OutgoingDataAck,
+
+    // Connection clean up
+    ConnectionCleanup,
+
+    // Client Data
+    ClientMessage(Message),
+
+    // Shutdowning the eventloop
+    Shutdown,
+}
+
+pub struct ClientBuilder<P: Protocol, M> {
+    protocol: P,
+    mode: M,
+    clients: usize,
+    options: MqttOptions,
+    network_options: NetworkOptions,
+}
+
+impl<P: Protocol, M> ClientBuilder<P, M> {
+    pub fn new(
+        protocol: P,
+        mode: M,
+        options: MqttOptions,
+        network_options: NetworkOptions,
+    ) -> ClientBuilder<P, M> {
+        Self {
+            protocol,
+            mode,
+            clients: 1,
+            options,
+            network_options,
+        }
     }
-}
-
-impl From<Subscribe> for Request {
-    fn from(subscribe: Subscribe) -> Request {
-        Request::Subscribe(subscribe)
+    pub fn with_clients(mut self, clients: usize) -> Self {
+        self.clients = clients;
+        self
     }
-}
+    pub fn with_version(mut self, protocol: P) -> Self {
+        self.protocol = protocol;
+        self
+    }
+    pub fn with_mode(mut self, mode: M) -> Self {
+        self.mode = mode;
+        self
+    }
 
-impl From<Unsubscribe> for Request {
-    fn from(unsubscribe: Unsubscribe) -> Request {
-        Request::Unsubscribe(unsubscribe)
+    pub fn build(self) -> Vec<Client<P, M>> {
+        let event_rx = EventsRx::new(1024);
+
+        let mut clients = Vec::new();
+        let mut client_states = Vec::new();
+        for i in 0..self.clients {
+            let event_tx = event_rx.producer(i);
+            let (ack_tx, acks_rx) = flume::bounded(128);
+            let (subs_tx, subs_rx) = flume::bounded(128);
+            let client = Client::<P, M>::new(i, P::new(), event_tx, acks_rx, subs_rx);
+            let client_state = ClientState {
+                id: i,
+                acks_channel: ack_tx,
+                subcription_channel: subs_tx,
+                subcs: Vec::new(),
+            };
+            clients.push(client);
+            client_states.push(client_state);
+        }
+
+        thread::Builder::new()
+            .name("Eventloop".into())
+            .spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                runtime.block_on(async move {
+                    let mut eventloop: Eventloop<P> =
+                        Eventloop::new(self.options, self.network_options, event_rx, client_states);
+                    eventloop.start().await;
+                })
+            });
+
+        clients
     }
 }
 
@@ -226,19 +293,19 @@ impl From<Unsubscribe> for Request {
 #[derive(Clone)]
 pub enum Transport {
     Tcp,
-    #[cfg(any(feature = "use-rustls-no-provider", feature = "use-native-tls"))]
-    Tls(TlsConfiguration),
-    #[cfg(unix)]
-    Unix,
-    #[cfg(feature = "websocket")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "websocket")))]
-    Ws,
-    #[cfg(all(feature = "use-rustls-no-provider", feature = "websocket"))]
-    #[cfg_attr(
-        docsrs,
-        doc(cfg(all(feature = "use-rustls-no-provider", feature = "websocket")))
-    )]
-    Wss(TlsConfiguration),
+    // #[cfg(any(feature = "use-rustls-no-provider", feature = "use-native-tls"))]
+    // Tls(TlsConfiguration),
+    // #[cfg(unix)]
+    // Unix,
+    // #[cfg(feature = "websocket")]
+    // #[cfg_attr(docsrs, doc(cfg(feature = "websocket")))]
+    // Ws,
+    // #[cfg(all(feature = "use-rustls-no-provider", feature = "websocket"))]
+    // #[cfg_attr(
+    //     docsrs,
+    //     doc(cfg(all(feature = "use-rustls-no-provider", feature = "websocket")))
+    // )]
+    // Wss(TlsConfiguration),
 }
 
 impl Default for Transport {
@@ -253,143 +320,143 @@ impl Transport {
         Self::Tcp
     }
 
-    #[cfg(feature = "use-rustls-no-provider")]
-    pub fn tls_with_default_config() -> Self {
-        Self::tls_with_config(Default::default())
-    }
+    // #[cfg(feature = "use-rustls-no-provider")]
+    // pub fn tls_with_default_config() -> Self {
+    //     Self::tls_with_config(Default::default())
+    // }
 
-    /// Use secure tcp with tls as transport
-    #[cfg(feature = "use-rustls-no-provider")]
-    pub fn tls(
-        ca: Vec<u8>,
-        client_auth: Option<(Vec<u8>, Vec<u8>)>,
-        alpn: Option<Vec<Vec<u8>>>,
-    ) -> Self {
-        let config = TlsConfiguration::Simple {
-            ca,
-            alpn,
-            client_auth,
-        };
+    // /// Use secure tcp with tls as transport
+    // #[cfg(feature = "use-rustls-no-provider")]
+    // pub fn tls(
+    //     ca: Vec<u8>,
+    //     client_auth: Option<(Vec<u8>, Vec<u8>)>,
+    //     alpn: Option<Vec<Vec<u8>>>,
+    // ) -> Self {
+    //     let config = TlsConfiguration::Simple {
+    //         ca,
+    //         alpn,
+    //         client_auth,
+    //     };
 
-        Self::tls_with_config(config)
-    }
+    //     Self::tls_with_config(config)
+    // }
 
-    #[cfg(any(feature = "use-rustls-no-provider", feature = "use-native-tls"))]
-    pub fn tls_with_config(tls_config: TlsConfiguration) -> Self {
-        Self::Tls(tls_config)
-    }
+    // #[cfg(any(feature = "use-rustls-no-provider", feature = "use-native-tls"))]
+    // pub fn tls_with_config(tls_config: TlsConfiguration) -> Self {
+    //     Self::Tls(tls_config)
+    // }
 
-    #[cfg(unix)]
-    pub fn unix() -> Self {
-        Self::Unix
-    }
+    // #[cfg(unix)]
+    // pub fn unix() -> Self {
+    //     Self::Unix
+    // }
 
-    /// Use websockets as transport
-    #[cfg(feature = "websocket")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "websocket")))]
-    pub fn ws() -> Self {
-        Self::Ws
-    }
+    // /// Use websockets as transport
+    // #[cfg(feature = "websocket")]
+    // #[cfg_attr(docsrs, doc(cfg(feature = "websocket")))]
+    // pub fn ws() -> Self {
+    //     Self::Ws
+    // }
 
-    /// Use secure websockets with tls as transport
-    #[cfg(all(feature = "use-rustls-no-provider", feature = "websocket"))]
-    #[cfg_attr(
-        docsrs,
-        doc(cfg(all(feature = "use-rustls-no-provider", feature = "websocket")))
-    )]
-    pub fn wss(
-        ca: Vec<u8>,
-        client_auth: Option<(Vec<u8>, Vec<u8>)>,
-        alpn: Option<Vec<Vec<u8>>>,
-    ) -> Self {
-        let config = TlsConfiguration::Simple {
-            ca,
-            client_auth,
-            alpn,
-        };
+    // /// Use secure websockets with tls as transport
+    // #[cfg(all(feature = "use-rustls-no-provider", feature = "websocket"))]
+    // #[cfg_attr(
+    //     docsrs,
+    //     doc(cfg(all(feature = "use-rustls-no-provider", feature = "websocket")))
+    // )]
+    // pub fn wss(
+    //     ca: Vec<u8>,
+    //     client_auth: Option<(Vec<u8>, Vec<u8>)>,
+    //     alpn: Option<Vec<Vec<u8>>>,
+    // ) -> Self {
+    //     let config = TlsConfiguration::Simple {
+    //         ca,
+    //         client_auth,
+    //         alpn,
+    //     };
 
-        Self::wss_with_config(config)
-    }
+    //     Self::wss_with_config(config)
+    // }
 
-    #[cfg(all(feature = "use-rustls-no-provider", feature = "websocket"))]
-    #[cfg_attr(
-        docsrs,
-        doc(cfg(all(feature = "use-rustls-no-provider", feature = "websocket")))
-    )]
-    pub fn wss_with_config(tls_config: TlsConfiguration) -> Self {
-        Self::Wss(tls_config)
-    }
+    // #[cfg(all(feature = "use-rustls-no-provider", feature = "websocket"))]
+    // #[cfg_attr(
+    //     docsrs,
+    //     doc(cfg(all(feature = "use-rustls-no-provider", feature = "websocket")))
+    // )]
+    // pub fn wss_with_config(tls_config: TlsConfiguration) -> Self {
+    //     Self::Wss(tls_config)
+    // }
 
-    #[cfg(all(feature = "use-rustls-no-provider", feature = "websocket"))]
-    #[cfg_attr(
-        docsrs,
-        doc(cfg(all(feature = "use-rustls-no-provider", feature = "websocket")))
-    )]
-    pub fn wss_with_default_config() -> Self {
-        Self::Wss(Default::default())
-    }
+    // #[cfg(all(feature = "use-rustls-no-provider", feature = "websocket"))]
+    // #[cfg_attr(
+    //     docsrs,
+    //     doc(cfg(all(feature = "use-rustls-no-provider", feature = "websocket")))
+    // )]
+    // pub fn wss_with_default_config() -> Self {
+    //     Self::Wss(Default::default())
+    // }
 }
 
 /// TLS configuration method
-#[derive(Clone, Debug)]
-#[cfg(any(feature = "use-rustls-no-provider", feature = "use-native-tls"))]
-pub enum TlsConfiguration {
-    #[cfg(feature = "use-rustls-no-provider")]
-    Simple {
-        /// ca certificate
-        ca: Vec<u8>,
-        /// alpn settings
-        alpn: Option<Vec<Vec<u8>>>,
-        /// tls client_authentication
-        client_auth: Option<(Vec<u8>, Vec<u8>)>,
-    },
-    #[cfg(feature = "use-native-tls")]
-    SimpleNative {
-        /// ca certificate
-        ca: Vec<u8>,
-        /// pkcs12 binary der and
-        /// password for use with der
-        client_auth: Option<(Vec<u8>, String)>,
-    },
-    #[cfg(feature = "use-rustls-no-provider")]
-    /// Injected rustls ClientConfig for TLS, to allow more customisation.
-    Rustls(Arc<ClientConfig>),
-    #[cfg(feature = "use-native-tls")]
-    /// Use default native-tls configuration
-    Native,
-    #[cfg(feature = "use-native-tls")]
-    /// Injected native-tls TlsConnector for TLS, to allow more customisation.
-    NativeConnector(TlsConnector),
-}
+// #[derive(Clone, Debug)]
+// #[cfg(any(feature = "use-rustls-no-provider", feature = "use-native-tls"))]
+// pub enum TlsConfiguration {
+//     #[cfg(feature = "use-rustls-no-provider")]
+//     Simple {
+//         /// ca certificate
+//         ca: Vec<u8>,
+//         /// alpn settings
+//         alpn: Option<Vec<Vec<u8>>>,
+//         /// tls client_authentication
+//         client_auth: Option<(Vec<u8>, Vec<u8>)>,
+//     },
+//     #[cfg(feature = "use-native-tls")]
+//     SimpleNative {
+//         /// ca certificate
+//         ca: Vec<u8>,
+//         /// pkcs12 binary der and
+//         /// password for use with der
+//         client_auth: Option<(Vec<u8>, String)>,
+//     },
+//     #[cfg(feature = "use-rustls-no-provider")]
+//     /// Injected rustls ClientConfig for TLS, to allow more customisation.
+//     Rustls(Arc<ClientConfig>),
+//     #[cfg(feature = "use-native-tls")]
+//     /// Use default native-tls configuration
+//     Native,
+//     #[cfg(feature = "use-native-tls")]
+//     /// Injected native-tls TlsConnector for TLS, to allow more customisation.
+//     NativeConnector(TlsConnector),
+// }
 
-#[cfg(feature = "use-rustls-no-provider")]
-impl Default for TlsConfiguration {
-    fn default() -> Self {
-        let mut root_cert_store = RootCertStore::empty();
-        for cert in load_native_certs().expect("could not load platform certs") {
-            root_cert_store.add(cert).unwrap();
-        }
-        let tls_config = ClientConfig::builder()
-            .with_root_certificates(root_cert_store)
-            .with_no_client_auth();
+// #[cfg(feature = "use-rustls-no-provider")]
+// impl Default for TlsConfiguration {
+//     fn default() -> Self {
+//         let mut root_cert_store = RootCertStore::empty();
+//         for cert in load_native_certs().expect("could not load platform certs") {
+//             root_cert_store.add(cert).unwrap();
+//         }
+//         let tls_config = ClientConfig::builder()
+//             .with_root_certificates(root_cert_store)
+//             .with_no_client_auth();
 
-        Self::Rustls(Arc::new(tls_config))
-    }
-}
+//         Self::Rustls(Arc::new(tls_config))
+//     }
+// }
 
-#[cfg(feature = "use-rustls-no-provider")]
-impl From<ClientConfig> for TlsConfiguration {
-    fn from(config: ClientConfig) -> Self {
-        TlsConfiguration::Rustls(Arc::new(config))
-    }
-}
+// #[cfg(feature = "use-rustls-no-provider")]
+// impl From<ClientConfig> for TlsConfiguration {
+//     fn from(config: ClientConfig) -> Self {
+//         TlsConfiguration::Rustls(Arc::new(config))
+//     }
+// }
 
-#[cfg(feature = "use-native-tls")]
-impl From<TlsConnector> for TlsConfiguration {
-    fn from(connector: TlsConnector) -> Self {
-        TlsConfiguration::NativeConnector(connector)
-    }
-}
+// #[cfg(feature = "use-native-tls")]
+// impl From<TlsConnector> for TlsConfiguration {
+//     fn from(connector: TlsConnector) -> Self {
+//         TlsConfiguration::NativeConnector(connector)
+//     }
+// }
 
 /// Provides a way to configure low level network connection configurations
 #[derive(Clone, Default)]
@@ -660,7 +727,10 @@ impl MqttOptions {
         username: U,
         password: P,
     ) -> &mut Self {
-        self.credentials = Some(Login::new(username, password));
+        self.credentials = Some(Login {
+            username: username.into(),
+            password: password.into(),
+        });
         self
     }
 
@@ -715,36 +785,36 @@ impl MqttOptions {
         self.manual_acks
     }
 
-    #[cfg(feature = "proxy")]
-    pub fn set_proxy(&mut self, proxy: Proxy) -> &mut Self {
-        self.proxy = Some(proxy);
-        self
-    }
+    // #[cfg(feature = "proxy")]
+    // pub fn set_proxy(&mut self, proxy: Proxy) -> &mut Self {
+    //     self.proxy = Some(proxy);
+    //     self
+    // }
 
-    #[cfg(feature = "proxy")]
-    pub fn proxy(&self) -> Option<Proxy> {
-        self.proxy.clone()
-    }
+    // #[cfg(feature = "proxy")]
+    // pub fn proxy(&self) -> Option<Proxy> {
+    //     self.proxy.clone()
+    // }
 
-    #[cfg(feature = "websocket")]
-    pub fn set_request_modifier<F, O>(&mut self, request_modifier: F) -> &mut Self
-    where
-        F: Fn(http::Request<()>) -> O + Send + Sync + 'static,
-        O: IntoFuture<Output = http::Request<()>> + 'static,
-        O::IntoFuture: Send,
-    {
-        self.request_modifier = Some(Arc::new(move |request| {
-            let request_modifier = request_modifier(request).into_future();
-            Box::pin(request_modifier)
-        }));
+    // #[cfg(feature = "websocket")]
+    // pub fn set_request_modifier<F, O>(&mut self, request_modifier: F) -> &mut Self
+    // where
+    //     F: Fn(http::Request<()>) -> O + Send + Sync + 'static,
+    //     O: IntoFuture<Output = http::Request<()>> + 'static,
+    //     O::IntoFuture: Send,
+    // {
+    //     self.request_modifier = Some(Arc::new(move |request| {
+    //         let request_modifier = request_modifier(request).into_future();
+    //         Box::pin(request_modifier)
+    //     }));
 
-        self
-    }
+    //     self
+    // }
 
-    #[cfg(feature = "websocket")]
-    pub fn request_modifier(&self) -> Option<RequestModifierFn> {
-        self.request_modifier.clone()
-    }
+    // #[cfg(feature = "websocket")]
+    // pub fn request_modifier(&self) -> Option<RequestModifierFn> {
+    //     self.request_modifier.clone()
+    // }
 }
 
 #[cfg(feature = "url")]
@@ -941,7 +1011,11 @@ mod test {
     #[test]
     #[cfg(all(feature = "use-rustls-no-provider", feature = "websocket"))]
     fn no_scheme() {
-        let mut mqttoptions = MqttOptions::new("client_a", "a3f8czas.iot.eu-west-1.amazonaws.com/mqtt?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=MyCreds%2F20201001%2Feu-west-1%2Fiotdevicegateway%2Faws4_request&X-Amz-Date=20201001T130812Z&X-Amz-Expires=7200&X-Amz-Signature=9ae09b49896f44270f2707551581953e6cac71a4ccf34c7c3415555be751b2d1&X-Amz-SignedHeaders=host", 443);
+        let mut mqttoptions = MqttOptions::new(
+            "client_a",
+            "a3f8czas.iot.eu-west-1.amazonaws.com/mqtt?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=MyCreds%2F20201001%2Feu-west-1%2Fiotdevicegateway%2Faws4_request&X-Amz-Date=20201001T130812Z&X-Amz-Expires=7200&X-Amz-Signature=9ae09b49896f44270f2707551581953e6cac71a4ccf34c7c3415555be751b2d1&X-Amz-SignedHeaders=host",
+            443,
+        );
 
         mqttoptions.set_transport(crate::Transport::wss(Vec::from("Test CA"), None, None));
 
@@ -958,7 +1032,10 @@ mod test {
             panic!("Unexpected transport!");
         }
 
-        assert_eq!(mqttoptions.broker_addr, "a3f8czas.iot.eu-west-1.amazonaws.com/mqtt?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=MyCreds%2F20201001%2Feu-west-1%2Fiotdevicegateway%2Faws4_request&X-Amz-Date=20201001T130812Z&X-Amz-Expires=7200&X-Amz-Signature=9ae09b49896f44270f2707551581953e6cac71a4ccf34c7c3415555be751b2d1&X-Amz-SignedHeaders=host");
+        assert_eq!(
+            mqttoptions.broker_addr,
+            "a3f8czas.iot.eu-west-1.amazonaws.com/mqtt?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=MyCreds%2F20201001%2Feu-west-1%2Fiotdevicegateway%2Faws4_request&X-Amz-Date=20201001T130812Z&X-Amz-Expires=7200&X-Amz-Signature=9ae09b49896f44270f2707551581953e6cac71a4ccf34c7c3415555be751b2d1&X-Amz-SignedHeaders=host"
+        );
     }
 
     #[test]

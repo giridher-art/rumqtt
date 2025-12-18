@@ -1,11 +1,7 @@
-use super::mqttbytes::v5::{
-    ConnAck, ConnectReturnCode, Disconnect, DisconnectReasonCode, Packet, PingReq, PubAck,
-    PubAckReason, PubComp, PubCompReason, PubRec, PubRecReason, PubRel, PubRelReason, Publish,
-    SubAck, Subscribe, SubscribeReasonCode, UnsubAck, UnsubAckReason, Unsubscribe,
-};
-use super::mqttbytes::{self, Error as MqttError, QoS};
+use crate::protocol::Protocol;
+use crate::rumqttc_next::state::State;
 
-use super::{Event, Incoming, Outgoing, Request};
+use super::Incoming;
 
 use bytes::Bytes;
 use fixedbitset::FixedBitSet;
@@ -111,7 +107,89 @@ pub struct MqttState {
     /// Upper limit on the maximum number of allowed inflight QoS1 & QoS2 requests
     max_outgoing_inflight_upper_limit: u16,
 }
+impl State for MqttState {
+    /// Returns inflight outgoing packets and clears internal queues
+    fn clean(&mut self) -> Vec<Request> {
+        let mut pending = Vec::with_capacity(100);
+        // remove and collect pending publishes
+        for publish in self.outgoing_pub.iter_mut() {
+            if let Some(publish) = publish.take() {
+                let request = Request::Publish(publish);
+                pending.push(request);
+            }
+        }
 
+        // remove and collect pending releases
+        for pkid in self.outgoing_rel.ones() {
+            let request = Request::PubRel(PubRel::new(pkid as u16, None));
+            pending.push(request);
+        }
+        self.outgoing_rel.clear();
+
+        // remove packed ids of incoming qos2 publishes
+        self.incoming_pub.clear();
+
+        self.await_pingresp = false;
+        self.collision_ping_count = 0;
+        self.inflight = 0;
+        pending
+    }
+
+    fn inflight(&self) -> u16 {
+        self.inflight
+    }
+    /// Consolidates handling of all outgoing mqtt packet logic. Returns a packet which should
+    /// be put on to the network by the eventloop
+    fn handle_outgoing_packet(&mut self, request: Request) -> Result<Option<Packet>, StateError> {
+        let packet = match request {
+            Request::Publish(publish) => self.outgoing_publish(publish)?,
+            Request::PubRel(pubrel) => self.outgoing_pubrel(pubrel)?,
+            Request::Subscribe(subscribe) => self.outgoing_subscribe(subscribe)?,
+            Request::Unsubscribe(unsubscribe) => self.outgoing_unsubscribe(unsubscribe)?,
+            Request::PingReq => self.outgoing_ping()?,
+            Request::Disconnect => {
+                self.outgoing_disconnect(DisconnectReasonCode::NormalDisconnection)?
+            }
+            Request::PubAck(puback) => self.outgoing_puback(puback)?,
+            Request::PubRec(pubrec) => self.outgoing_pubrec(pubrec)?,
+            _ => unimplemented!(),
+        };
+
+        self.last_outgoing = Instant::now();
+        Ok(packet)
+    }
+
+    /// Consolidates handling of all incoming mqtt packets. Returns a `Notification` which for the
+    /// user to consume and `Packet` which for the eventloop to put on the network
+    /// E.g For incoming QoS1 publish packet, this method returns (Publish, Puback). Publish packet will
+    /// be forwarded to user and Pubck packet will be written to network
+    fn handle_incoming_packet(
+        &mut self,
+        mut packet: Incoming,
+    ) -> Result<Option<Packet>, StateError> {
+        self.events.push_back(Event::Incoming(packet.to_owned()));
+
+        let outgoing = match &mut packet {
+            Incoming::PingResp(_) => self.handle_incoming_pingresp()?,
+            Incoming::Publish(publish) => self.handle_incoming_publish(publish)?,
+            Incoming::SubAck(suback) => self.handle_incoming_suback(suback)?,
+            Incoming::UnsubAck(unsuback) => self.handle_incoming_unsuback(unsuback)?,
+            Incoming::PubAck(puback) => self.handle_incoming_puback(puback)?,
+            Incoming::PubRec(pubrec) => self.handle_incoming_pubrec(pubrec)?,
+            Incoming::PubRel(pubrel) => self.handle_incoming_pubrel(pubrel)?,
+            Incoming::PubComp(pubcomp) => self.handle_incoming_pubcomp(pubcomp)?,
+            Incoming::ConnAck(connack) => self.handle_incoming_connack(connack)?,
+            Incoming::Disconnect(disconn) => self.handle_incoming_disconn(disconn)?,
+            _ => {
+                error!("Invalid incoming packet = {:?}", packet);
+                return Err(StateError::WrongPacket);
+            }
+        };
+
+        self.last_incoming = Instant::now();
+        Ok(outgoing)
+    }
+}
 impl MqttState {
     /// Creates new mqtt state. Same state should be used during a
     /// connection for persistent sessions while new state should
@@ -138,92 +216,6 @@ impl MqttState {
             max_outgoing_inflight: max_inflight,
             max_outgoing_inflight_upper_limit: max_inflight,
         }
-    }
-
-    /// Returns inflight outgoing packets and clears internal queues
-    pub fn clean(&mut self) -> Vec<Request> {
-        let mut pending = Vec::with_capacity(100);
-        // remove and collect pending publishes
-        for publish in self.outgoing_pub.iter_mut() {
-            if let Some(publish) = publish.take() {
-                let request = Request::Publish(publish);
-                pending.push(request);
-            }
-        }
-
-        // remove and collect pending releases
-        for pkid in self.outgoing_rel.ones() {
-            let request = Request::PubRel(PubRel::new(pkid as u16, None));
-            pending.push(request);
-        }
-        self.outgoing_rel.clear();
-
-        // remove packed ids of incoming qos2 publishes
-        self.incoming_pub.clear();
-
-        self.await_pingresp = false;
-        self.collision_ping_count = 0;
-        self.inflight = 0;
-        pending
-    }
-
-    pub fn inflight(&self) -> u16 {
-        self.inflight
-    }
-
-    /// Consolidates handling of all outgoing mqtt packet logic. Returns a packet which should
-    /// be put on to the network by the eventloop
-    pub fn handle_outgoing_packet(
-        &mut self,
-        request: Request,
-    ) -> Result<Option<Packet>, StateError> {
-        let packet = match request {
-            Request::Publish(publish) => self.outgoing_publish(publish)?,
-            Request::PubRel(pubrel) => self.outgoing_pubrel(pubrel)?,
-            Request::Subscribe(subscribe) => self.outgoing_subscribe(subscribe)?,
-            Request::Unsubscribe(unsubscribe) => self.outgoing_unsubscribe(unsubscribe)?,
-            Request::PingReq => self.outgoing_ping()?,
-            Request::Disconnect => {
-                self.outgoing_disconnect(DisconnectReasonCode::NormalDisconnection)?
-            }
-            Request::PubAck(puback) => self.outgoing_puback(puback)?,
-            Request::PubRec(pubrec) => self.outgoing_pubrec(pubrec)?,
-            _ => unimplemented!(),
-        };
-
-        self.last_outgoing = Instant::now();
-        Ok(packet)
-    }
-
-    /// Consolidates handling of all incoming mqtt packets. Returns a `Notification` which for the
-    /// user to consume and `Packet` which for the eventloop to put on the network
-    /// E.g For incoming QoS1 publish packet, this method returns (Publish, Puback). Publish packet will
-    /// be forwarded to user and Pubck packet will be written to network
-    pub fn handle_incoming_packet(
-        &mut self,
-        mut packet: Incoming,
-    ) -> Result<Option<Packet>, StateError> {
-        self.events.push_back(Event::Incoming(packet.to_owned()));
-
-        let outgoing = match &mut packet {
-            Incoming::PingResp(_) => self.handle_incoming_pingresp()?,
-            Incoming::Publish(publish) => self.handle_incoming_publish(publish)?,
-            Incoming::SubAck(suback) => self.handle_incoming_suback(suback)?,
-            Incoming::UnsubAck(unsuback) => self.handle_incoming_unsuback(unsuback)?,
-            Incoming::PubAck(puback) => self.handle_incoming_puback(puback)?,
-            Incoming::PubRec(pubrec) => self.handle_incoming_pubrec(pubrec)?,
-            Incoming::PubRel(pubrel) => self.handle_incoming_pubrel(pubrel)?,
-            Incoming::PubComp(pubcomp) => self.handle_incoming_pubcomp(pubcomp)?,
-            Incoming::ConnAck(connack) => self.handle_incoming_connack(connack)?,
-            Incoming::Disconnect(disconn) => self.handle_incoming_disconn(disconn)?,
-            _ => {
-                error!("Invalid incoming packet = {:?}", packet);
-                return Err(StateError::WrongPacket);
-            }
-        };
-
-        self.last_incoming = Instant::now();
-        Ok(outgoing)
     }
 
     pub fn handle_protocol_error(&mut self) -> Result<Option<Packet>, StateError> {
