@@ -1,13 +1,13 @@
 [package]
 name = "rumqttc"
 version = "0.25.1"
-edition = "2024"
 publish = true
 description = "An efficient and robust mqtt client for your connected devices"
 keywords = ["mqtt", "iot", "coap", "http"]
 categories = ["network-programming"]
 rust-version = "1.91.0"
 repository.workspace = true
+edition.workspace = true
 license.workspace = true
 authors.workspace = true
 
