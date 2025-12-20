@@ -1,4 +1,4 @@
-use futures_util::{StreamExt, future::join_all};
+use futures_util::{future::join_all, StreamExt};
 use rumqttc::{AsyncMode, ClientBuilder, Message, MqttOptions, NetworkOptions, V4};
 use std::{thread, time::Duration};
 use tokio::runtime::Handle;
@@ -10,6 +10,7 @@ async fn test_rumqttc_next() {
         .with_clients(1)
         .with_mode(AsyncMode)
         .build();
+
     let mut client = clients.get_mut(0).unwrap();
 
     let tokenid1 = client

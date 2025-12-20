@@ -1,10 +1,10 @@
 use super::*;
 
 use crate::eventloop::ConnectionHandle;
-use crate::protocol;
 use crate::protocol::v4::{self, subscribe};
 use crate::ClientState;
 use crate::Incoming;
+use crate::{protocol, Router};
 use fixedbitset::FixedBitSet;
 use std::collections::{HashMap, VecDeque};
 use std::ops::Sub;
@@ -45,12 +45,6 @@ pub struct OutgoingPacket {
     pub packet: Packet,
 }
 
-#[derive(Debug)]
-pub struct SubscriptionLog {
-    pub filter: String,
-    pub clients: Vec<usize>,
-}
-
 /// State of the mqtt connection.
 // Design: Methods will just modify the state of the object without doing any network operations
 // Design: All inflight queues are maintained in a pre initialized vec with index as packet id.
@@ -71,8 +65,6 @@ pub struct MqttState<P: Protocol> {
     last_incoming: Instant,
     /// Last outgoing packet time
     last_outgoing: Instant,
-    /// Subscription Logs
-    pub(crate) logs: Vec<SubscriptionLog>,
     /// Packet id of the last outgoing packet
     pub(crate) last_pkid: u16,
     /// Packet id of the last acked packet
@@ -91,8 +83,10 @@ pub struct MqttState<P: Protocol> {
     pub collision: Option<(u16, OutgoingPacket)>,
     /// Indicates if acknowledgements should be send immediately
     pub manual_acks: bool,
-    // clients
-    pub clients: Vec<ClientState>,
+    // Packets
+    pub packets: Vec<Incoming>,
+    // Router
+    pub router: Router,
 }
 
 impl<P: Protocol> MqttState<P> {
@@ -111,24 +105,24 @@ impl<P: Protocol> MqttState<P> {
             collision_ping_count: 0,
             outgoing_rel: FixedBitSet::with_capacity(max_inflight as usize),
             incoming_pub: FixedBitSet::with_capacity(u16::MAX as usize + 1),
-            logs: Vec::new(),
             last_incoming: Instant::now(),
             last_outgoing: Instant::now(),
             last_pkid: 0,
             last_ack: 0,
             inflight: 0,
             max_inflight,
+            packets: Vec::new(),
             // index 0 is wasted as 0 is not a valid packet id
             outgoing_packet: vec![None; max_inflight as usize + 1],
-
             collision: None,
             manual_acks,
-            clients,
+            router: Router::new(clients),
         }
     }
 
     pub fn read_incoming(&mut self) {
-        if let Ok(packets) = self.connection_handle.read_packets() {
+        if let Ok(()) = self.connection_handle.read_packets(&mut self.packets) {
+            let packets = self.packets.drain(..).collect::<Vec<_>>();
             for packet in packets {
                 self.handle_incoming_packet(packet);
             }
@@ -170,50 +164,6 @@ impl<P: Protocol> MqttState<P> {
         self.inflight
     }
 
-    fn send_client(&mut self, client_id: usize, message: Message) {
-        if let Some(client) = self.clients.get(client_id) {
-            client.acks_channel.send(message);
-        }
-    }
-
-    fn send_publish(&mut self, publish: Publish) {
-        let topic = publish.topic.clone();
-        let mut client_set = Vec::new();
-        for log in self.logs.iter() {
-            if matches(topic.as_str(), log.filter.as_str()) {
-                self.clients.iter().for_each(|x| {
-                    if !client_set.contains(&x.id) {
-                        x.subcription_channel
-                            .send(publish.clone())
-                            .expect("failed to send the publish");
-                    }
-                    client_set.push(x.id);
-                });
-            }
-        }
-    }
-
-    fn intialize_logs(&mut self, client_id: usize, filters: Vec<String>) {
-        for filter in filters {
-            if let Some(log) = self.logs.iter_mut().find(|l| l.filter == filter) {
-                log.clients.push(client_id);
-            } else {
-                self.logs.push(SubscriptionLog {
-                    filter,
-                    clients: vec![client_id],
-                });
-            }
-        }
-    }
-
-    fn revoke_subscriptions(&mut self, client_id: usize, filters: Vec<String>) {
-        for filter in filters {
-            if let Some(log) = self.logs.iter_mut().find(|l| l.filter == filter) {
-                log.clients.retain(|x| *x != client_id);
-            }
-        }
-    }
-
     /// Consolidates handling of all outgoing mqtt packet logic. Returns a packet which should
     /// be put on to the network by the eventloop
     pub fn handle_outgoing_packet(
@@ -247,7 +197,6 @@ impl<P: Protocol> MqttState<P> {
     /// E.g For incoming QoS1 publish packet, this method returns (Publish, Puback). Publish packet will
     /// be forwarded to user and Pubck packet will be written to network
     pub fn handle_incoming_packet(&mut self, packet: Incoming) -> Result<(), StateError> {
-        println!("Incoming Packet: {:?}", packet);
         let outgoing = match &packet {
             Incoming::PingResp(_pingresp) => self.handle_incoming_pingresp()?,
             Incoming::Publish(publish) => self.handle_incoming_publish(publish)?,
@@ -286,19 +235,27 @@ impl<P: Protocol> MqttState<P> {
                         .iter()
                         .zip(suback.return_codes.iter())
                         .collect::<Vec<_>>();
-                    let mut filters = Vec::new();
                     for (filter, allowed) in res {
                         match allowed {
                             SubscribeReasonCode::QoS0
                             | SubscribeReasonCode::QoS1
                             | SubscribeReasonCode::QoS2
                             | SubscribeReasonCode::Success(_) => {
-                                filters.push(filter.path.clone());
+                                if self.manual_acks {
+                                    self.router.add_log(
+                                        filter.path.clone(),
+                                        crate::SubscritptionStrategy::RoundRobin,
+                                    );
+                                } else {
+                                    self.router.add_log(
+                                        filter.path.clone(),
+                                        crate::SubscritptionStrategy::Broadcast,
+                                    );
+                                }
                             }
                             _ => {}
                         }
                     }
-                    self.intialize_logs(outgoing_packet.client_id, filters);
                 }
                 _ => return Err(StateError::Unsolicited(suback.pkid)),
             }
@@ -307,7 +264,8 @@ impl<P: Protocol> MqttState<P> {
                 suback: suback.return_codes.clone(),
                 properties: None,
             };
-            self.send_client(outgoing_packet.client_id, Message::SubscribeAck(msg));
+            self.router
+                .ack(outgoing_packet.client_id, Message::SubscribeAck(msg));
         } else {
             error!("Unsolicited puback packet: {:?}", suback.pkid);
             return Err(StateError::Unsolicited(suback.pkid));
@@ -341,10 +299,10 @@ impl<P: Protocol> MqttState<P> {
                 token_id: outgoing_packet.token_id,
                 reason_codes: unsuback.reasons.clone(),
             };
-            self.send_client(outgoing_packet.client_id, Message::UnSubAck(msg));
+            self.router
+                .ack(outgoing_packet.client_id, Message::UnSubAck(msg));
             match outgoing_packet.packet {
                 Packet::Unsubscribe(unsub) => {
-                    let mut filters = Vec::new();
                     let res = unsub
                         .filters
                         .iter()
@@ -353,15 +311,23 @@ impl<P: Protocol> MqttState<P> {
                     for (filter, reason) in res {
                         match reason {
                             UnsubAckReason::Success => {
-                                filters.push(filter.clone());
+                                self.router
+                                    .remove_subscription(outgoing_packet.client_id, filter);
                             }
                             _ => {}
                         }
                     }
-                    self.revoke_subscriptions(outgoing_packet.client_id, filters);
                 }
                 _ => {}
             }
+
+            let msg = UnSubscribeResp {
+                token_id: outgoing_packet.token_id,
+                reason_codes: unsuback.reasons.clone(),
+            };
+
+            self.router
+                .ack(outgoing_packet.client_id, Message::UnSubAck(msg));
         }
         Ok(None)
     }
@@ -370,7 +336,7 @@ impl<P: Protocol> MqttState<P> {
     /// in case of QoS1 and Replys rec in case of QoS while also storing the message
     fn handle_incoming_publish(&mut self, publish: &Publish) -> Result<Option<Packet>, StateError> {
         let qos = publish.qos;
-        self.send_publish(publish.clone());
+        self.router.publish(publish.clone());
         match qos {
             QoS::AtMostOnce => Ok(None),
             QoS::AtLeastOnce => {
@@ -420,7 +386,8 @@ impl<P: Protocol> MqttState<P> {
                 token_id: outgoing_packet.token_id,
                 puback: puback.clone(),
             };
-            self.send_client(outgoing_packet.client_id, Message::PublishAck(msg));
+            self.router
+                .ack(outgoing_packet.client_id, Message::PublishAck(msg));
         } else {
             error!("Unsolicited puback packet: {:?}", puback.pkid);
             return Err(StateError::Unsolicited(puback.pkid));
@@ -493,7 +460,8 @@ impl<P: Protocol> MqttState<P> {
                 token_id: outgoing_packet.token_id,
                 pubcomp: pubcomp.clone(),
             };
-            self.send_client(outgoing_packet.client_id, Message::PublishComp(msg));
+            self.router
+                .ack(outgoing_packet.client_id, Message::PublishComp(msg));
         } else {
             error!("Unsolicited puback packet: {:?}", pubcomp.pkid);
             return Err(StateError::Unsolicited(pubcomp.pkid));

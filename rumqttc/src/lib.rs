@@ -163,7 +163,7 @@ pub use crate::{
     client::{AsyncMode, Client, SyncMode},
     eventloop::Eventloop,
     events::{EventsRx, EventsTx},
-    protocol::{Protocol, v4::V4},
+    protocol::{v4::V4, Protocol},
     state::v4::MqttState,
 };
 
@@ -175,6 +175,109 @@ pub struct ClientState {
     acks_channel: Sender<Message>,
     subcription_channel: Sender<Publish>,
     subcs: Vec<usize>,
+}
+#[derive(Debug)]
+pub enum SubscritptionStrategy {
+    Broadcast,
+    RoundRobin,
+}
+
+#[derive(Debug)]
+pub struct Log {
+    pub filter: String,
+    pub strategy: SubscritptionStrategy,
+    pub current_client: usize,
+    pub clients: Vec<usize>,
+}
+
+impl Log {
+    pub fn new(filter: String, strategy: SubscritptionStrategy) -> Self {
+        Self {
+            filter,
+            strategy,
+            current_client: 0,
+            clients: Vec::new(),
+        }
+    }
+
+    pub fn add_client(&mut self, client_id: usize) {
+        self.clients.push(client_id);
+    }
+
+    pub fn clear_clients(&mut self) {
+        self.clients.clear();
+    }
+
+    pub fn remove_client(&mut self, client_id: usize) {
+        self.clients.retain(|x| *x != client_id);
+    }
+}
+
+#[derive(Debug)]
+pub struct Router {
+    pub logs: Vec<Log>,
+    pub clients: Vec<ClientState>,
+}
+
+impl Router {
+    pub fn new(clients: Vec<ClientState>) -> Self {
+        Self {
+            logs: Vec::new(),
+            clients,
+        }
+    }
+
+    pub fn add_log(&mut self, filter: String, strategy: SubscritptionStrategy) {
+        let log = Log::new(filter, strategy);
+        self.logs.push(log);
+    }
+
+    pub fn remove_subscription(&mut self, client_id: usize, filter: &str) {
+        for log in self.logs.iter_mut() {
+            if log.filter == filter {
+                log.remove_client(client_id);
+            }
+        }
+    }
+
+    pub fn remove_log(&mut self, filter: &str) {
+        self.logs.retain(|x| x.filter != filter);
+    }
+
+    pub fn clear_logs(&mut self) {
+        self.logs.clear();
+    }
+
+    pub fn publish(&mut self, packet: Publish) {
+        for log in self.logs.iter_mut() {
+            if matches(&packet.topic, &log.filter) {
+                match log.strategy {
+                    SubscritptionStrategy::Broadcast => {
+                        for id in log.clients.iter() {
+                            if let Some(client) = self.clients.iter().find(|x| x.id == *id) {
+                                let _ = client.subcription_channel.send(packet.clone());
+                            }
+                        }
+                    }
+                    SubscritptionStrategy::RoundRobin => {
+                        if let Some(client) = self
+                            .clients
+                            .iter()
+                            .find(|x| x.id == log.clients[log.current_client])
+                        {
+                            let _ = client.subcription_channel.send(packet.clone());
+                        }
+                        log.current_client = (log.current_client + 1) % log.clients.len();
+                    }
+                }
+            }
+        }
+    }
+    pub fn ack(&mut self, client_id: usize, msg: Message) {
+        if let Some(client) = self.clients.iter().find(|x| x.id == client_id) {
+            let _ = client.acks_channel.send(msg);
+        }
+    }
 }
 
 #[derive(Debug)]

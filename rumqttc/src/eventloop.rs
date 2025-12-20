@@ -7,25 +7,26 @@ use std::{
     time::Duration,
 };
 
-use futures_util::{StreamExt, io};
-use tokio::net::{TcpSocket, TcpStream, lookup_host};
+use futures_util::{io, StreamExt};
+use tokio::net::{lookup_host, TcpSocket, TcpStream};
 
 use crate::{
-    ClientState, ConnectReturnCode, Control, IOEvent, Message, MqttOptions, NetworkOptions, Packet,
-    PubAck, Publish, SubAck, SubscribeReasonCode, UnsubAck, UnsubAckReason,
     client::Client,
     connection::Connection,
     events::{EventsRx, EventsTx},
     message::{self, PubComp, PubRec, QoS},
     protocol::{
-        self, Protocol,
-        v4::{V4, subscribe},
+        self,
+        v4::{subscribe, V4},
+        Protocol,
     },
     state::{
         self,
         v4::{MqttState, OutgoingPacket, StateError},
     },
     xchg::{XchgPipeA, XchgPipeB},
+    ClientState, ConnectReturnCode, Control, IOEvent, Log, Message, MqttOptions, NetworkOptions,
+    Packet, PubAck, Publish, SubAck, SubscribeReasonCode, UnsubAck, UnsubAckReason,
 };
 #[derive(Debug)]
 pub struct ConnectionHandle<P: Protocol> {
@@ -36,7 +37,6 @@ pub struct ConnectionHandle<P: Protocol> {
     max_incoming_packet_size: usize,
     max_outgoing_packet_size: usize,
     control_tx: flume::Sender<Control>,
-    packet_buffer: Vec<Packet>,
 }
 
 impl<P: Protocol> ConnectionHandle<P> {
@@ -56,81 +56,39 @@ impl<P: Protocol> ConnectionHandle<P> {
                 control_tx,
                 max_incoming_packet_size,
                 max_outgoing_packet_size,
-                packet_buffer: Vec::new(),
             },
             connection,
         )
     }
-    pub fn read_packets(&mut self) -> Result<Vec<Packet>, protocol::Error> {
-        // if let Ok(mut buf) = self.connection_to_io.try_recv() {
-        //     self.inflight_incoming.append(&mut buf);
-        //     self.connection_to_io.ack(buf);
-        // }
+    pub fn read_packets(&mut self, mut packets: &mut Vec<Packet>) -> Result<(), protocol::Error> {
+        if let Ok(mut buf) = self.connection_to_io.try_recv() {
+            self.inflight_incoming.append(&mut buf);
+            self.connection_to_io.ack(buf);
+        }
 
-        // let mut packets = Vec::new();
-        // // parse the packet from buf
-        // loop {
-        //     match self.protocol.read(
-        //         &mut &self.inflight_incoming[..],
-        //         self.max_incoming_packet_size,
-        //     ) {
-        //         Ok(packet) => {
-        //             packets.push(packet);
-        //         }
-        //         Err(e) => {
-        //             break;
-        //         }
-        //     };
-        // }
+        // parse the packet from buf
+        loop {
+            match self.protocol.read(
+                &mut &self.inflight_incoming[..],
+                self.max_incoming_packet_size,
+            ) {
+                Ok(packet) => {
+                    packets.push(packet);
+                }
+                Err(e) => {
+                    break;
+                }
+            };
+        }
 
-        // return Ok(packets);
-
-        // For simulating the connection
-        let packets = self.packet_buffer.drain(..).collect::<Vec<_>>();
-        println!("ConnectionHandle: read_packets: {:?}", packets);
-        Ok(packets)
+        Ok(())
     }
 
     pub fn write_packet(&mut self, packet: Packet) -> Result<(), protocol::Error> {
-        match packet {
-            Packet::Publish(publish) => {
-                self.packet_buffer.push(Packet::PubAck(PubAck {
-                    pkid: publish.pkid,
-                    reason: crate::PubAckReason::Success,
-                    properties: None,
-                }));
-            }
-
-            Packet::PingReq(pinreq) => {
-                self.packet_buffer.push(Packet::PingResp(crate::PingResp));
-            }
-
-            Packet::Subscribe(sub) => {
-                self.packet_buffer.push(Packet::SubAck(SubAck {
-                    pkid: sub.pkid,
-                    return_codes: vec![
-                        SubscribeReasonCode::Success(QoS::AtMostOnce);
-                        sub.filters.len()
-                    ],
-                    properties: None,
-                }));
-
-                self.packet_buffer.push(Packet::Publish(Publish::new(
-                    sub.filters.get(0).unwrap().path.clone(),
-                    QoS::AtLeastOnce,
-                    b"hello",
-                    false,
-                )));
-            }
-            Packet::Unsubscribe(unsub) => {
-                self.packet_buffer.push(Packet::UnsubAck(UnsubAck {
-                    pkid: unsub.pkid,
-                    reasons: vec![UnsubAckReason::Success; unsub.filters.len()],
-                    properties: None,
-                }));
-            }
-            _ => {}
-        }
+        let (buf, _) = self.io_to_connection.active.raw_mut();
+        self.protocol.write(packet, buf);
+        self.io_to_connection.recycler.try_recv();
+        self.io_to_connection.try_forward();
         Ok(())
     }
 }
@@ -170,6 +128,7 @@ impl<P: Protocol> Eventloop<P> {
                 connection_handle,
                 clients,
             ),
+
             network_options,
             mqtt_options: options,
         }
