@@ -158,6 +158,7 @@ pub type Incoming = Packet;
 use std::{marker::PhantomData, thread};
 
 use flume::Sender;
+use tokio::io::{AsyncRead, AsyncWrite};
 
 pub use crate::{
     client::{AsyncMode, Client, SyncMode},
@@ -191,12 +192,12 @@ pub struct Log {
 }
 
 impl Log {
-    pub fn new(filter: String, strategy: SubscritptionStrategy) -> Self {
+    pub fn new(client_id: usize, filter: String, strategy: SubscritptionStrategy) -> Self {
         Self {
             filter,
             strategy,
             current_client: 0,
-            clients: Vec::new(),
+            clients: vec![client_id],
         }
     }
 
@@ -227,8 +228,15 @@ impl Router {
         }
     }
 
-    pub fn add_log(&mut self, filter: String, strategy: SubscritptionStrategy) {
-        let log = Log::new(filter, strategy);
+    pub fn add_log(&mut self, client_id: usize, filter: String, strategy: SubscritptionStrategy) {
+        for log in self.logs.iter_mut() {
+            if filter == log.filter {
+                log.add_client(client_id);
+                return;
+            }
+        }
+
+        let log = Log::new(client_id, filter, strategy);
         self.logs.push(log);
     }
 
@@ -275,6 +283,7 @@ impl Router {
     }
     pub fn ack(&mut self, client_id: usize, msg: Message) {
         if let Some(client) = self.clients.iter().find(|x| x.id == client_id) {
+            println!("Sending ack to client {}: {:?}", client_id, msg);
             let _ = client.acks_channel.send(msg);
         }
     }
@@ -302,6 +311,9 @@ pub enum IOEvent {
     // Connection data
     ConnectionData,
 
+    // Connection Terminated
+    ConnectionTerminated,
+
     // keep_alive
     Refresh,
 
@@ -328,13 +340,12 @@ pub struct ClientBuilder<P: Protocol, M> {
 
 impl<P: Protocol, M> ClientBuilder<P, M> {
     pub fn new(
-        protocol: P,
         mode: M,
         options: MqttOptions,
         network_options: NetworkOptions,
     ) -> ClientBuilder<P, M> {
         Self {
-            protocol,
+            protocol: P::new(),
             mode,
             clients: 1,
             options,
@@ -347,10 +358,6 @@ impl<P: Protocol, M> ClientBuilder<P, M> {
     }
     pub fn with_version(mut self, protocol: P) -> Self {
         self.protocol = protocol;
-        self
-    }
-    pub fn with_mode(mut self, mode: M) -> Self {
-        self.mode = mode;
         self
     }
 
@@ -392,6 +399,12 @@ impl<P: Protocol, M> ClientBuilder<P, M> {
     }
 }
 
+pub trait AsyncReadWrite: AsyncRead + AsyncWrite + Send + Unpin {}
+impl<T> AsyncReadWrite for T where T: AsyncRead + AsyncWrite + Send + Unpin {}
+// network
+pub struct Network {
+    pub stream: Box<dyn AsyncReadWrite>,
+}
 /// Transport methods. Defaults to TCP.
 #[derive(Clone)]
 pub enum Transport {

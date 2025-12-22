@@ -10,8 +10,8 @@ use tokio::{
 };
 
 use crate::{
-    Control, EventsTx, IOEvent,
-    xchg::{XchgPipeA, XchgPipeB, pipe},
+    xchg::{pipe, XchgPipeA, XchgPipeB},
+    AsyncReadWrite, Control, EventsTx, IOEvent,
 };
 
 use super::CleanupMethod;
@@ -51,85 +51,60 @@ impl Connection {
         (connection, io_to_conn_tx, conn_to_io_rx)
     }
 
-    pub async fn start(&mut self) -> Result<(), std::io::Error>
-// where
-    //     T: AsyncReadExt + AsyncWriteExt + Unpin,
-    {
+    pub async fn start(
+        &mut self,
+        mut stream: &mut Box<dyn AsyncReadWrite>,
+    ) -> Result<(), std::io::Error> {
         loop {
-            tokio::time::sleep(Duration::from_millis(5)).await;
-            self.events_tx
-                .send_async(IOEvent::ConnectionData)
-                .await
-                .unwrap();
-            println!("Connection: heartbeat");
+            // TODO(swanx): we shall improve these names!!
+            let has_space = self.connection_to_io.active.remaining_space() > 0;
+            let (buffer, size) = self.connection_to_io.active.raw_mut();
+
+            select! {
+                // Read from network and fill read buffer
+                v = read_from_stream(buffer, &mut stream), if has_space => {
+                    *size += v?;
+                    // dbg!(_n);
+                    if self.connection_to_io.try_forward() {
+                        self.events_tx.send_async(IOEvent::ConnectionData).await.unwrap();
+                    }
+                }
+                _ = self.connection_to_io.recycler.wait() => {
+                    // dbg!("received back incoming_tx buffer");
+                    let standby = self.connection_to_io.recycler.standby().unwrap();
+                    stream.write_all(standby).await?;
+                    self.connection_to_io.recycler.clear();
+                    // try to send to active buffer to other end
+                    if self.connection_to_io.try_forward() {
+                        self.events_tx.send_async(IOEvent::ConnectionData).await.unwrap();
+                    }
+                }
+                data = self.io_to_connection.incoming.recv_async() => {
+                   let mut data = data.expect("use ? here");
+                    stream.write_all(&data).await?;
+                    data.clear();
+                    self.io_to_connection.ack(data);
+                    self.events_tx.send_async(IOEvent::OutgoingDataAck).await.unwrap();
+                }
+                signal = self.control_rx.recv_async() => {
+                    match signal.expect("should recv") {
+                        Control::Terminate => {
+                            self.events_tx.send_async(IOEvent::ConnectionTerminated).await.unwrap();
+                            return Ok(());
+                        },
+                        Control::CleanupAck => unreachable!(),
+                        Control::Stats => self.print_stats()
+                    }
+                }
+            }
         }
-        // we should get some data from stream within timeout!
-        //     let (buffer, size) = self.connection_to_io.active.raw_mut();
-        //     let read = timeout(
-        //         Duration::from_secs(self.timeout as u64),
-        //         read_from_stream(buffer, stream),
-        //     )
-        //     .await
-        //     .map_err(|_| io::Error::from(ErrorKind::StaleNetworkFileHandle))??;
-
-        //     *size += read;
-
-        //     self.active = true;
-
-        //     if self.connection_to_io.try_forward() {
-        //         self.events_tx
-        //             .send_async(IOEvent::ConnectionData)
-        //             .await
-        //             .unwrap();
-        //     }
-
-        //     loop {
-        //         // TODO(swanx): we shall improve these names!!
-        //         let has_space = self.connection_to_io.active.remaining_space() > 0;
-        //         let (buffer, size) = self.connection_to_io.active.raw_mut();
-
-        //         select! {
-        //             // Read from network and fill read buffer
-        //             v = read_from_stream(buffer, stream), if has_space => {
-        //                 *size += v?;
-
-        //                 // dbg!(_n);
-        //                 if self.connection_to_io.try_forward() {
-        //                     self.events_tx.send_async(IOEvent::ConnectionData).await.unwrap();
-        //                 }
-        //             }
-        //             _ = self.connection_to_io.recycler.wait() => {
-        //                 // dbg!("received back incoming_tx buffer");
-        //                 let standby = self.connection_to_io.recycler.standby().unwrap();
-        //                 stream.write_all(standby).await?;
-        //                 self.connection_to_io.recycler.clear();
-        //                 // try to send to active buffer to other end
-        //                 if self.connection_to_io.try_forward() {
-        //                     self.events_tx.send_async(IOEvent::ConnectionData).await.unwrap();
-        //                 }
-        //             }
-        //             data = self.io_to_connection.incoming.recv_async() => {
-        //                 let mut data = data.expect("use ? here");
-        //                 stream.write_all(&data).await?;
-        //                 data.clear();
-        //                 self.io_to_connection.ack(data);
-        //                 self.events_tx.send_async(IOEvent::OutgoingDataAck).await.unwrap();
-        //             }
-        //             signal = self.control_rx.recv_async() => {
-        //                 match signal.expect("should recv") {
-        //                     Control::Terminate => return Ok(()),
-        //                     Control::CleanupAck => unreachable!(),
-        //                     Control::Stats => self.print_stats()
-        //                 }
-        //             }
-        //         }
-        //     }
     }
 
-    pub async fn cleanup<T>(&mut self, stream: &mut T, method: CleanupMethod)
-    where
-        T: AsyncReadExt + AsyncWriteExt + Unpin,
-    {
+    pub async fn cleanup<T>(
+        &mut self,
+        stream: &mut Box<dyn AsyncReadWrite>,
+        method: CleanupMethod,
+    ) {
         if !self.active {
             self.connection_to_io.clear();
             self.active = false;

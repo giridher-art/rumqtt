@@ -3,12 +3,16 @@ use std::{
     net::SocketAddr,
     option,
     sync::Arc,
-    thread::{self, JoinHandle},
+    thread::{self},
     time::Duration,
 };
 
 use futures_util::{io, StreamExt};
 use tokio::net::{lookup_host, TcpSocket, TcpStream};
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    task::JoinHandle,
+};
 
 use crate::{
     client::Client,
@@ -25,8 +29,9 @@ use crate::{
         v4::{MqttState, OutgoingPacket, StateError},
     },
     xchg::{XchgPipeA, XchgPipeB},
-    ClientState, ConnectReturnCode, Control, IOEvent, Log, Message, MqttOptions, NetworkOptions,
-    Packet, PubAck, Publish, SubAck, SubscribeReasonCode, UnsubAck, UnsubAckReason,
+    ClientState, Connect, ConnectReturnCode, Control, IOEvent, Log, Message, MqttOptions, Network,
+    NetworkOptions, Packet, PubAck, Publish, SubAck, SubscribeReasonCode, Transport, UnsubAck,
+    UnsubAckReason,
 };
 #[derive(Debug)]
 pub struct ConnectionHandle<P: Protocol> {
@@ -46,7 +51,7 @@ impl<P: Protocol> ConnectionHandle<P> {
         max_outgoing_packet_size: usize,
     ) -> (Self, Connection) {
         let (control_tx, control_rx) = flume::bounded(1);
-        let (connection, io_to_conn, conn_to_io) = Connection::new(event_tx, control_rx, 100);
+        let (connection, io_to_conn, conn_to_io) = Connection::new(event_tx, control_rx, 10);
         (
             Self {
                 protocol: P::new(),
@@ -64,29 +69,34 @@ impl<P: Protocol> ConnectionHandle<P> {
         if let Ok(mut buf) = self.connection_to_io.try_recv() {
             self.inflight_incoming.append(&mut buf);
             self.connection_to_io.ack(buf);
-        }
 
-        // parse the packet from buf
-        loop {
-            match self.protocol.read(
-                &mut &self.inflight_incoming[..],
-                self.max_incoming_packet_size,
-            ) {
-                Ok(packet) => {
-                    packets.push(packet);
-                }
-                Err(e) => {
-                    break;
-                }
-            };
+            let mut stream = self.inflight_incoming.as_slice();
+            // parse the packet from buf
+            loop {
+                match self
+                    .protocol
+                    .read(&mut stream, self.max_incoming_packet_size)
+                {
+                    Ok(packet) => {
+                        packets.push(packet);
+                    }
+                    Err(e) => {
+                        break;
+                    }
+                };
+            }
+            self.inflight_incoming = stream.to_vec();
         }
 
         Ok(())
     }
 
-    pub fn write_packet(&mut self, packet: Packet) -> Result<(), protocol::Error> {
+    pub fn write_packet(&mut self, packet: Option<Packet>) -> Result<(), protocol::Error> {
         let (buf, _) = self.io_to_connection.active.raw_mut();
-        self.protocol.write(packet, buf);
+        if let Some(packet) = packet {
+            println!("Writing packet: {:?}", packet);
+            self.protocol.write(packet, buf);
+        }
         self.io_to_connection.recycler.try_recv();
         self.io_to_connection.try_forward();
         Ok(())
@@ -104,16 +114,19 @@ pub struct Eventloop<P: Protocol> {
     pub state: MqttState<P>,
     //network options
     pub network_options: NetworkOptions,
+    // joinhandle for connection task
+    pub connection_handle: Option<JoinHandle<Connection>>,
 }
 
 impl<P: Protocol> Eventloop<P> {
     pub fn new(
         options: MqttOptions,
         network_options: NetworkOptions,
-        event_rx: EventsRx<IOEvent>,
+        mut event_rx: EventsRx<IOEvent>,
         clients: Vec<ClientState>,
     ) -> Eventloop<P> {
         let event_tx = event_rx.producer(0);
+        event_rx.add_timer(options.keep_alive.clone());
         let (connection_handle, connection) = ConnectionHandle::<P>::new(
             event_tx,
             options.max_incoming_packet_size,
@@ -131,35 +144,47 @@ impl<P: Protocol> Eventloop<P> {
 
             network_options,
             mqtt_options: options,
+            connection_handle: None,
         }
     }
 
-    pub fn add_keep_alive(&mut self, keep_alive: u64) {
-        self.event_rx.add_timer(Duration::from_secs(keep_alive));
+    fn add_keep_alive(&mut self, keep_alive: Duration) {
+        self.event_rx.add_timer(keep_alive);
     }
 
     pub async fn start(&mut self) -> Result<(), ConnectionError> {
+        let mut network = connect(&mut self.mqtt_options, self.network_options.clone()).await?;
+
         if let Some(mut connection) = self.connection.take() {
-            tokio::spawn(async move {
-                connection.start().await;
+            let handle = tokio::spawn(async move {
+                if let Err(e) = connection.start(&mut network.stream).await {
+                    println!("Connection error: {:?}", e);
+                }
+                connection
             });
+            self.connection_handle = Some(handle);
         }
         while let Some((source_id, event)) = self.event_rx.next().await {
-            println!("Eventloop: Received Event: {:?}", event);
+            self.event_rx
+                .reset_timer(self.mqtt_options.keep_alive.clone());
             match event {
                 IOEvent::ConnectionData => {
-                    println!("Eventloop: Connection Data");
                     self.state.read_incoming();
+                }
+                IOEvent::ConnectionTerminated => {
+                    if let Some(handle) = self.connection_handle.take() {
+                        self.connection = Some(handle.await.unwrap());
+                    }
                 }
                 IOEvent::Refresh => {
                     self.state
                         .handle_outgoing_packet(source_id, Message::Ping)?;
                 }
                 IOEvent::ClientMessage(msg) => {
-                    println!("Eventloop: Client Message: {:?}", msg);
                     self.state.handle_outgoing_packet(source_id, msg);
                 }
                 IOEvent::Shutdown => {}
+                IOEvent::OutgoingDataAck => {}
                 _ => {}
             }
         }
@@ -202,150 +227,221 @@ pub enum ConnectionError {
     // ResponseValidation(#[from] crate::websockets::ValidationError),
 }
 
-// pub(crate) async fn socket_connect(
-//     host: String,
-//     network_options: NetworkOptions,
-// ) -> std::io::Result<TcpStream> {
-//     let addrs = lookup_host(host).await?;
-//     let mut last_err = None;
+async fn connect(
+    options: &mut MqttOptions,
+    network_options: NetworkOptions,
+) -> Result<Network, ConnectionError> {
+    println!("Connecting to local host");
+    // connect to the broker
 
-//     for addr in addrs {
-//         let socket = match addr {
-//             SocketAddr::V4(_) => TcpSocket::new_v4()?,
-//             SocketAddr::V6(_) => TcpSocket::new_v6()?,
-//         };
+    let mut network = network_connect(options, network_options).await.unwrap();
+    println!("Network connected");
+    // make MQTT connection request (which internally awaits for ack)
+    let connack = mqtt_connect(options, &mut network).await?;
+    println!("Mqtt Connected");
 
-//         socket.set_nodelay(network_options.tcp_nodelay)?;
+    Ok(network)
+}
 
-//         if let Some(send_buff_size) = network_options.tcp_send_buffer_size {
-//             socket.set_send_buffer_size(send_buff_size).unwrap();
-//         }
-//         if let Some(recv_buffer_size) = network_options.tcp_recv_buffer_size {
-//             socket.set_recv_buffer_size(recv_buffer_size).unwrap();
-//         }
+pub(crate) async fn socket_connect(
+    host: String,
+    network_options: NetworkOptions,
+) -> std::io::Result<TcpStream> {
+    let addrs = lookup_host(host).await?;
+    let mut last_err = None;
 
-//         #[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))]
-//         {
-//             if let Some(bind_device) = &network_options.bind_device {
-//                 // call the bind_device function only if the bind_device network option is defined
-//                 // If binding device is None or an empty string it removes the binding,
-//                 // which is causing PermissionDenied errors in AWS environment (lambda function).
-//                 socket.bind_device(Some(bind_device.as_bytes()))?;
-//             }
-//         }
+    for addr in addrs {
+        let socket = match addr {
+            SocketAddr::V4(_) => TcpSocket::new_v4()?,
+            SocketAddr::V6(_) => TcpSocket::new_v6()?,
+        };
 
-//         match socket.connect(addr).await {
-//             Ok(s) => return Ok(s),
-//             Err(e) => {
-//                 last_err = Some(e);
-//             }
-//         };
-//     }
+        socket.set_nodelay(network_options.tcp_nodelay)?;
 
-//     Err(last_err.unwrap_or_else(|| {
-//         io::Error::new(
-//             io::ErrorKind::InvalidInput,
-//             "could not resolve to any address",
-//         )
-//     }))
-// }
+        if let Some(send_buff_size) = network_options.tcp_send_buffer_size {
+            socket.set_send_buffer_size(send_buff_size).unwrap();
+        }
+        if let Some(recv_buffer_size) = network_options.tcp_recv_buffer_size {
+            socket.set_recv_buffer_size(recv_buffer_size).unwrap();
+        }
 
-// async fn network_connect(
-//     options: &MqttOptions,
-//     network_options: NetworkOptions,
-// ) -> Result<impl AsyncReadWrite, ConnectionError> {
-//     // Process Unix files early, as proxy is not supported for them.
-//     #[cfg(unix)]
-//     if matches!(options.transport(), Transport::Unix) {
-//         use tokio::net::UnixStream;
+        #[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))]
+        {
+            if let Some(bind_device) = &network_options.bind_device {
+                // call the bind_device function only if the bind_device network option is defined
+                // If binding device is None or an empty string it removes the binding,
+                // which is causing PermissionDenied errors in AWS environment (lambda function).
+                socket.bind_device(Some(bind_device.as_bytes()))?;
+            }
+        }
 
-//         let file = options.broker_addr.as_str();
-//         let socket = UnixStream::connect(Path::new(file)).await?;
+        match socket.connect(addr).await {
+            Ok(s) => {
+                println!(" connected a stream");
+                return Ok(s);
+            }
+            Err(e) => {
+                last_err = Some(e);
+            }
+        };
+    }
 
-//         return Ok(socket);
-//     }
+    Err(last_err.unwrap_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "could not resolve to any address",
+        )
+    }))
+}
 
-//     // For websockets domain and port are taken directly from `broker_addr` (which is a url).
-//     let (domain, port) = match options.transport() {
-//         #[cfg(feature = "websocket")]
-//         Transport::Ws => split_url(&options.broker_addr)?,
-//         #[cfg(all(feature = "use-rustls-no-provider", feature = "websocket"))]
-//         Transport::Wss(_) => split_url(&options.broker_addr)?,
-//         _ => options.broker_address(),
-//     };
+async fn network_connect(
+    options: &MqttOptions,
+    network_options: NetworkOptions,
+) -> Result<Network, ConnectionError> {
+    // Process Unix files early, as proxy is not supported for them.
+    // #[cfg(unix)]
+    // if matches!(options.transport(), Transport::Unix) {
+    //     use std::path::Path;
 
-//     let addr = format!("{domain}:{port}");
-//     let stream = socket_connect(addr, network_options).await?;
-//     Ok(stream)
+    //     use tokio::net::UnixStream;
 
-// let tcp_stream = {
-//     // #[cfg(feature = "proxy")]
-//     // match options.proxy() {
-//     //     Some(proxy) => proxy.connect(&domain, port, network_options).await?,
-//     //     None => {
-//     //         let addr = format!("{domain}:{port}");
-//     //         socket_connect(addr, network_options).await?
-//     //     }
-//     // }
-//     #[cfg(not(feature = "proxy"))]
-//     {
-//         let addr = format!("{domain}:{port}");
-//         socket_connect(addr, network_options).await
-//     }
-// };
+    //     let file = options.broker_addr.as_str();
+    //     let socket = UnixStream::connect(Path::new(file)).await?;
 
-// let network = match options.transport() {
-//     Transport::Tcp => tcp_stream,
-//     #[cfg(any(feature = "use-rustls-no-provider", feature = "use-native-tls"))]
-//     Transport::Tls(tls_config) => {
-//         use crate::tls;
+    //     return Ok(Network {
+    //         stream: Box::new(socket),
+    //     });
+    // }
 
-//         let socket =
-//             tls::tls_connect(&options.broker_addr, options.port, &tls_config, tcp_stream)
-//                 .await?;
-//         socket
-//     }
-//     #[cfg(unix)]
-//     Transport::Unix => unreachable!(),
-//     #[cfg(feature = "websocket")]
-//     Transport::Ws => {
-//         let mut request = options.broker_addr.as_str().into_client_request()?;
-//         request
-//             .headers_mut()
-//             .insert("Sec-WebSocket-Protocol", "mqtt".parse().unwrap());
+    // For websockets domain and port are taken directly from `broker_addr` (which is a url).
+    let (domain, port) = match options.transport() {
+        // #[cfg(feature = "websocket")]
+        // Transport::Ws => split_url(&options.broker_addr)?,
+        // #[cfg(all(feature = "use-rustls-no-provider", feature = "websocket"))]
+        // Transport::Wss(_) => split_url(&options.broker_addr)?,
+        _ => options.broker_address(),
+    };
 
-//         if let Some(request_modifier) = options.request_modifier() {
-//             request = request_modifier(request).await;
-//         }
+    let addr = format!("{domain}:{port}");
+    let stream = socket_connect(addr, network_options).await?;
+    Ok(Network {
+        stream: Box::new(stream),
+    })
 
-//         let (socket, response) =
-//             async_tungstenite::tokio::client_async(request, tcp_stream).await?;
-//         validate_response_headers(response)?;
+    // let tcp_stream = {
+    //     // #[cfg(feature = "proxy")]
+    //     // match options.proxy() {
+    //     //     Some(proxy) => proxy.connect(&domain, port, network_options).await?,
+    //     //     None => {
+    //     //         let addr = format!("{domain}:{port}");
+    //     //         socket_connect(addr, network_options).await?
+    //     //     }
+    //     // }
+    //     #[cfg(not(feature = "proxy"))]
+    //     {
+    //         let addr = format!("{domain}:{port}");
+    //         socket_connect(addr, network_options).await
+    //     }
+    // };
 
-//         WsStream::new(socket)
-//     }
-//     #[cfg(all(feature = "use-rustls-no-provider", feature = "websocket"))]
-//     Transport::Wss(tls_config) => {
-//         let mut request = options.broker_addr.as_str().into_client_request()?;
-//         request
-//             .headers_mut()
-//             .insert("Sec-WebSocket-Protocol", "mqtt".parse().unwrap());
+    // let network = match options.transport() {
+    //     Transport::Tcp => tcp_stream,
+    //     //     #[cfg(any(feature = "use-rustls-no-provider", feature = "use-native-tls"))]
+    //     //     Transport::Tls(tls_config) => {
+    //     //         use crate::tls;
 
-//         if let Some(request_modifier) = options.request_modifier() {
-//             request = request_modifier(request).await;
-//         }
+    //     //         let socket =
+    //     //             tls::tls_connect(&options.broker_addr, options.port, &tls_config, tcp_stream)
+    //     //                 .await?;
+    //     //         socket
+    //     //     }
+    //     //     #[cfg(unix)]
+    //     //     Transport::Unix => unreachable!(),
+    //     //     #[cfg(feature = "websocket")]
+    //     //     Transport::Ws => {
+    //     //         let mut request = options.broker_addr.as_str().into_client_request()?;
+    //     //         request
+    //     //             .headers_mut()
+    //     //             .insert("Sec-WebSocket-Protocol", "mqtt".parse().unwrap());
 
-//         let connector = tls::rustls_connector(&tls_config).await?;
+    //     //         if let Some(request_modifier) = options.request_modifier() {
+    //     //             request = request_modifier(request).await;
+    //     //         }
 
-//         let (socket, response) = async_tungstenite::tokio::client_async_tls_with_connector(
-//             request,
-//             tcp_stream,
-//             Some(connector),
-//         )
-//         .await?;
-//         validate_response_headers(response)?;
+    //     //         let (socket, response) =
+    //     //             async_tungstenite::tokio::client_async(request, tcp_stream).await?;
+    //     //         validate_response_headers(response)?;
 
-//         WsStream::new(socket)
-//     }
-// };
-// }
+    //     //         WsStream::new(socket)
+    //     //     }
+    //     //     #[cfg(all(feature = "use-rustls-no-provider", feature = "websocket"))]
+    //     //     Transport::Wss(tls_config) => {
+    //     //         let mut request = options.broker_addr.as_str().into_client_request()?;
+    //     //         request
+    //     //             .headers_mut()
+    //     //             .insert("Sec-WebSocket-Protocol", "mqtt".parse().unwrap());
+
+    //     //         if let Some(request_modifier) = options.request_modifier() {
+    //     //             request = request_modifier(request).await;
+    //     //         }
+
+    //     //         let connector = tls::rustls_connector(&tls_config).await?;
+
+    //     //         let (socket, response) = async_tungstenite::tokio::client_async_tls_with_connector(
+    //     //             request,
+    //     //             tcp_stream,
+    //     //             Some(connector),
+    //     //         )
+    //     //         .await?;
+    //     //         validate_response_headers(response)?;
+
+    //     //         WsStream::new(socket)
+    // };
+
+    // Ok(stream)
+}
+
+async fn mqtt_connect(
+    options: &mut MqttOptions,
+    network: &mut Network,
+) -> Result<(), ConnectionError> {
+    let packet = Connect {
+        keep_alive: 5,
+        client_id: options.client_id.clone(),
+        clean_session: options.clean_session,
+        login: options.credentials.clone(),
+        last_will: options.last_will.clone(),
+        properties: None,
+    };
+
+    // ---- write CONNECT ----
+    let mut write_buf = Vec::new();
+    V4::write_connect(&V4, &packet, &mut write_buf);
+
+    network
+        .stream
+        .write_all(&write_buf)
+        .await
+        .map_err(ConnectionError::Io)?;
+
+    network.stream.flush().await.map_err(ConnectionError::Io)?;
+
+    // ---- read CONNACK ----
+    let mut read_buf = Vec::new();
+
+    // read *some* bytes (ConnAck is small)
+    network
+        .stream
+        .read_buf(&mut read_buf)
+        .await
+        .map_err(ConnectionError::Io)?;
+
+    let mut slice: &[u8] = &read_buf;
+    let packet =
+        V4::read(&V4, &mut slice, 1024 * 1024).map_err(|_| ConnectionError::NetworkTimeout)?;
+
+    match packet {
+        Packet::ConnAck(_) => Ok(()),
+        _ => Err(ConnectionError::NotConnAck(packet)),
+    }
+}

@@ -4,11 +4,11 @@ use tokio::{
     net::TcpStream,
     time::{Instant, Sleep},
 };
-use tokio_util::time::{DelayQueue, delay_queue::Key};
+use tokio_util::time::{delay_queue::Key, DelayQueue};
 
 use crate::IOEvent;
 
-use flume::{Receiver, Sender, r#async::RecvStream, bounded};
+use flume::{bounded, r#async::RecvStream, Receiver, Sender};
 use tokio::runtime::{self, Runtime};
 
 /// An Event Bus that allows consumers to poll it for events
