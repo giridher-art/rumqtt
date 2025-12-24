@@ -21,7 +21,7 @@ use crate::{
     message::{self, PubComp, PubRec, QoS},
     protocol::{
         self,
-        v4::{subscribe, V4},
+        v4::{disconnect, subscribe, V4},
         Protocol,
     },
     state::{
@@ -29,9 +29,9 @@ use crate::{
         v4::{MqttState, OutgoingPacket, StateError},
     },
     xchg::{XchgPipeA, XchgPipeB},
-    ClientState, Connect, ConnectReturnCode, Control, IOEvent, Log, Message, MqttOptions, Network,
-    NetworkOptions, Packet, PubAck, Publish, SubAck, SubscribeReasonCode, Transport, UnsubAck,
-    UnsubAckReason,
+    ClientState, Connect, ConnectReturnCode, Control, Disconnect, IOEvent, Log, Message,
+    MqttOptions, Network, NetworkOptions, Packet, PubAck, Publish, SubAck, SubscribeReasonCode,
+    Transport, UnsubAck, UnsubAckReason,
 };
 #[derive(Debug)]
 pub struct ConnectionHandle<P: Protocol> {
@@ -101,6 +101,17 @@ impl<P: Protocol> ConnectionHandle<P> {
         self.io_to_connection.try_forward();
         Ok(())
     }
+    pub fn clean(&mut self) {
+        if let Ok(buf) = self.connection_to_io.try_recv() {
+            self.connection_to_io.ack(buf);
+        }
+    }
+    pub fn send_cleanup(&mut self) {
+        self.control_tx.send(Control::Cleanup).unwrap();
+    }
+    pub fn close_connection(&mut self) {
+        self.control_tx.send(Control::Terminate).unwrap();
+    }
 }
 
 pub struct Eventloop<P: Protocol> {
@@ -115,7 +126,7 @@ pub struct Eventloop<P: Protocol> {
     //network options
     pub network_options: NetworkOptions,
     // joinhandle for connection task
-    pub connection_handle: Option<JoinHandle<Connection>>,
+    pub connection_handle: Option<JoinHandle<(Connection, Network)>>,
 }
 
 impl<P: Protocol> Eventloop<P> {
@@ -140,6 +151,7 @@ impl<P: Protocol> Eventloop<P> {
                 options.manual_acks.clone(),
                 connection_handle,
                 clients,
+                options.clean_session,
             ),
 
             network_options,
@@ -152,40 +164,108 @@ impl<P: Protocol> Eventloop<P> {
         self.event_rx.add_timer(keep_alive);
     }
 
-    pub async fn start(&mut self) -> Result<(), ConnectionError> {
-        let mut network = connect(&mut self.mqtt_options, self.network_options.clone()).await?;
+    async fn spawn_connection(
+        &mut self,
+        options: &MqttOptions,
+        network_options: &NetworkOptions,
+    ) -> Result<(), ConnectionError> {
+        let mut network = connect(&self.mqtt_options, &self.network_options).await?;
 
         if let Some(mut connection) = self.connection.take() {
             let handle = tokio::spawn(async move {
                 if let Err(e) = connection.start(&mut network.stream).await {
                     println!("Connection error: {:?}", e);
                 }
-                connection
+                (connection, network)
             });
             self.connection_handle = Some(handle);
         }
+        Ok(())
+    }
+
+    async fn reconnect(&mut self) -> Result<(), ConnectionError> {
+        if let Some(handle) = self.connection_handle.take() {
+            if let Ok((mut connection, _)) = handle.await {
+                let mut network =
+                    connect(&mut self.mqtt_options, &self.network_options.clone()).await?;
+                let handle = tokio::spawn(async move {
+                    if let Err(e) = connection.start(&mut network.stream).await {
+                        println!("Connection error: {:?}", e);
+                    }
+                    (connection, network)
+                });
+                self.connection_handle = Some(handle);
+            }
+        }
+        Ok(())
+    }
+
+    async fn disconnect(&mut self, disconnect: Disconnect) -> Result<(), ConnectionError> {
+        if let Some(handle) = self.connection_handle.take() {
+            if let Ok((_, network)) = handle.await {
+                mqtt_disconnect(network, disconnect).await?
+            }
+        }
+        Ok(())
+    }
+    pub async fn start(&mut self) -> Result<(), ConnectionError> {
+        self.spawn_connection(&self.mqtt_options.clone(), &self.network_options.clone())
+            .await;
+        self.state.active = true;
         while let Some((source_id, event)) = self.event_rx.next().await {
-            self.event_rx
-                .reset_timer(self.mqtt_options.keep_alive.clone());
-            match event {
+            println!("Event :{:?}", event);
+            let res = match event {
                 IOEvent::ConnectionData => {
-                    self.state.read_incoming();
-                }
-                IOEvent::ConnectionTerminated => {
-                    if let Some(handle) = self.connection_handle.take() {
-                        self.connection = Some(handle.await.unwrap());
+                    if let Err(e) = self.state.read_incoming() {
+                        Err(ConnectionError::MqttState(e))
+                    } else {
+                        Ok(())
                     }
                 }
+                IOEvent::ConnectionCleanup => {
+                    self.state.clean();
+                    println!("state is cleaned uo");
+                    Ok(())
+                }
+                IOEvent::ConnectionTerminated => {
+                    self.reconnect().await?;
+                    self.state.active = true;
+                    self.state.resend_pending();
+                    println!("Network is reconnected");
+                    Ok(())
+                }
                 IOEvent::Refresh => {
-                    self.state
-                        .handle_outgoing_packet(source_id, Message::Ping)?;
+                    self.event_rx
+                        .reset_timer(self.mqtt_options.keep_alive.clone());
+                    if let Err(e) = self.state.handle_outgoing_packet(source_id, Message::Ping) {
+                        Err(ConnectionError::MqttState(e))
+                    } else {
+                        Ok(())
+                    }
                 }
                 IOEvent::ClientMessage(msg) => {
-                    self.state.handle_outgoing_packet(source_id, msg);
+                    if let Err(e) = self.state.handle_outgoing_packet(source_id, msg) {
+                        Err(ConnectionError::MqttState(e))
+                    } else {
+                        Ok(())
+                    }
                 }
-                IOEvent::Shutdown => {}
-                IOEvent::OutgoingDataAck => {}
-                _ => {}
+                IOEvent::OutgoingDataAck => Ok(()),
+                IOEvent::Shutdown => {
+                    self.state.connection_handle.close_connection();
+                    self.state.router.shutdown();
+                    self.disconnect(Disconnect {
+                        reason_code: crate::DisconnectReasonCode::NormalDisconnection,
+                        properties: None,
+                    })
+                    .await
+                }
+                IOEvent::MockError => Err(ConnectionError::NetworkTimeout),
+                _ => Ok(()),
+            };
+            if let Err(e) = res {
+                self.state.active = false;
+                self.state.connection_handle.send_cleanup();
             }
         }
         Ok(())
@@ -228,8 +308,8 @@ pub enum ConnectionError {
 }
 
 async fn connect(
-    options: &mut MqttOptions,
-    network_options: NetworkOptions,
+    options: &MqttOptions,
+    network_options: &NetworkOptions,
 ) -> Result<Network, ConnectionError> {
     println!("Connecting to local host");
     // connect to the broker
@@ -245,7 +325,7 @@ async fn connect(
 
 pub(crate) async fn socket_connect(
     host: String,
-    network_options: NetworkOptions,
+    network_options: &NetworkOptions,
 ) -> std::io::Result<TcpStream> {
     let addrs = lookup_host(host).await?;
     let mut last_err = None;
@@ -296,7 +376,7 @@ pub(crate) async fn socket_connect(
 
 async fn network_connect(
     options: &MqttOptions,
-    network_options: NetworkOptions,
+    network_options: &NetworkOptions,
 ) -> Result<Network, ConnectionError> {
     // Process Unix files early, as proxy is not supported for them.
     // #[cfg(unix)]
@@ -401,10 +481,7 @@ async fn network_connect(
     // Ok(stream)
 }
 
-async fn mqtt_connect(
-    options: &mut MqttOptions,
-    network: &mut Network,
-) -> Result<(), ConnectionError> {
+async fn mqtt_connect(options: &MqttOptions, network: &mut Network) -> Result<(), ConnectionError> {
     let packet = Connect {
         keep_alive: 5,
         client_id: options.client_id.clone(),
@@ -444,4 +521,37 @@ async fn mqtt_connect(
         Packet::ConnAck(_) => Ok(()),
         _ => Err(ConnectionError::NotConnAck(packet)),
     }
+}
+
+async fn mqtt_disconnect(
+    mut network: Network,
+    disconnect: Disconnect,
+) -> Result<(), ConnectionError> {
+    // ---- write CONNECT ----
+    let mut write_buf = Vec::new();
+    V4::write(&V4, Packet::Disconnect(disconnect), &mut write_buf);
+
+    network
+        .stream
+        .write_all(&write_buf)
+        .await
+        .map_err(ConnectionError::Io)?;
+
+    network.stream.flush().await.map_err(ConnectionError::Io)?;
+
+    // ---- read CONNACK ----
+    let mut read_buf = Vec::new();
+
+    // read *some* bytes (ConnAck is small)
+    network
+        .stream
+        .read_buf(&mut read_buf)
+        .await
+        .map_err(ConnectionError::Io)?;
+
+    let mut slice: &[u8] = &read_buf;
+    let packet =
+        V4::read(&V4, &mut slice, 1024 * 1024).map_err(|_| ConnectionError::NetworkTimeout)?;
+
+    Ok(())
 }

@@ -10,11 +10,10 @@ use tokio::{
 };
 
 use crate::{
+    eventloop::ConnectionError,
     xchg::{pipe, XchgPipeA, XchgPipeB},
     AsyncReadWrite, Control, EventsTx, IOEvent,
 };
-
-use super::CleanupMethod;
 
 pub struct Connection {
     timeout: usize,
@@ -50,61 +49,84 @@ impl Connection {
 
         (connection, io_to_conn_tx, conn_to_io_rx)
     }
-
     pub async fn start(
         &mut self,
         mut stream: &mut Box<dyn AsyncReadWrite>,
-    ) -> Result<(), std::io::Error> {
+    ) -> Result<(), ConnectionError> {
         loop {
             // TODO(swanx): we shall improve these names!!
             let has_space = self.connection_to_io.active.remaining_space() > 0;
             let (buffer, size) = self.connection_to_io.active.raw_mut();
+            self.active = true;
 
-            select! {
+            let res: Result<(), ConnectionError> = select! {
                 // Read from network and fill read buffer
-                v = read_from_stream(buffer, &mut stream), if has_space => {
-                    *size += v?;
-                    // dbg!(_n);
-                    if self.connection_to_io.try_forward() {
-                        self.events_tx.send_async(IOEvent::ConnectionData).await.unwrap();
+                v = read_from_stream(buffer, &mut stream), if has_space  => {
+                    if let Err(e) = v{
+                        Err(ConnectionError::Io(e))
+                    } else {
+                        *size += v.unwrap();
+                        // dbg!(_n);
+                        if self.connection_to_io.try_forward() {
+                            self.events_tx.send_async(IOEvent::ConnectionData).await.unwrap();
+                        }
+                        Ok(())
                     }
                 }
                 _ = self.connection_to_io.recycler.wait() => {
                     // dbg!("received back incoming_tx buffer");
                     let standby = self.connection_to_io.recycler.standby().unwrap();
-                    stream.write_all(standby).await?;
-                    self.connection_to_io.recycler.clear();
-                    // try to send to active buffer to other end
-                    if self.connection_to_io.try_forward() {
-                        self.events_tx.send_async(IOEvent::ConnectionData).await.unwrap();
+                    match tokio::time::timeout(Duration::from_secs(self.timeout as u64), stream.write_all(standby)).await {
+                        Ok(Ok(())) => {
+                            self.connection_to_io.recycler.clear();
+                            // try to send to active buffer to other end
+                            if self.connection_to_io.try_forward() {
+                                self.events_tx.send_async(IOEvent::ConnectionData).await.unwrap();
+                            }
+                            Ok(())
+                        }
+                        Ok(Err(io_err)) => Err(ConnectionError::Io(io_err)),
+                        Err(_elapsed) => {
+                            Err(ConnectionError::NetworkTimeout)
+                        }
                     }
+
+
                 }
+
                 data = self.io_to_connection.incoming.recv_async() => {
                    let mut data = data.expect("use ? here");
-                    stream.write_all(&data).await?;
-                    data.clear();
-                    self.io_to_connection.ack(data);
-                    self.events_tx.send_async(IOEvent::OutgoingDataAck).await.unwrap();
+                    match tokio::time::timeout(Duration::from_secs(self.timeout as u64), stream.write_all(&data)).await {
+                        Ok(Ok(())) => {
+                            data.clear();
+                            self.io_to_connection.ack(data);
+                            self.events_tx.send_async(IOEvent::OutgoingDataAck).await.unwrap();
+                            Ok(())
+                        }
+                        Ok(Err(io_err)) => Err(ConnectionError::Io(io_err)),
+                        Err(_elapsed) => {
+                            Err(ConnectionError::NetworkTimeout)
+                        }
+                    }
                 }
                 signal = self.control_rx.recv_async() => {
                     match signal.expect("should recv") {
-                        Control::Terminate => {
-                            self.events_tx.send_async(IOEvent::ConnectionTerminated).await.unwrap();
-                            return Ok(());
-                        },
-                        Control::CleanupAck => unreachable!(),
-                        Control::Stats => self.print_stats()
+                        Control::Terminate => return Ok(()),
+                        Control::Cleanup => Err(ConnectionError::RequestsDone),
+
                     }
                 }
+            };
+            if let Err(e) = res {
+                self.cleanup(stream).await;
+                return Err(e);
             }
         }
+
+        Ok(())
     }
 
-    pub async fn cleanup<T>(
-        &mut self,
-        stream: &mut Box<dyn AsyncReadWrite>,
-        method: CleanupMethod,
-    ) {
+    pub async fn cleanup(&mut self, stream: &mut Box<dyn AsyncReadWrite>) {
         if !self.active {
             self.connection_to_io.clear();
             self.active = false;
@@ -112,98 +134,32 @@ impl Connection {
             return;
         }
 
-        // CRITICAL FIX: Send ConnectionCleanup BEFORE waiting for buffers to prevent deadlock
-        //
-        // Previous deadlock scenario (especially with DISCONNECT packets):
-        // 1. Connection sends buffer to IO via pipe for processing packets
-        // 2. IO's Framer stores buffer as inflight_acks (incoming_hub.rs:231)
-        // 3. DISCONNECT packet triggers IOError::ReceivedDisconnect (incoming_hub.rs:400)
-        // 4. Error return bypasses normal ack flow in io/src/lib.rs:342
-        //    - Normally, line 372-375 would process acks and return buffer
-        //    - But error propagation skips this, leaving buffer in Framer
-        // 5. IO sends Control::Terminate to Connection (io/src/lib.rs:267)
-        // 6. Connection's cleanup() tries to collect buffer via recycler.recv_async()
-        // 7. But buffer is stuck in IO's Framer.inflight_acks, never returned
-        // 8. Result: Connection waits forever for buffer that IO never returns
-        //
-        // Why the previous order caused deadlock:
-        // - Connection waited for buffer BEFORE sending ConnectionCleanup
-        // - IO only returns buffer when processing ConnectionCleanup
-        // - Circular dependency: each component waiting for the other
-        //
-        // Solution: Send ConnectionCleanup FIRST to break the cycle:
-        // 1. ConnectionCleanup sent to IO immediately
-        // 2. IO processes cleanup (io/src/lib.rs:526-568)
-        // 3. Calls incoming_hub.cleanup_connection() (line 471)
-        // 4. Returns inflight_acks buffer via pipe.ack() (incoming_hub.rs:185)
-        // 5. Connection's recycler.recv_async() now receives buffer
-        // 6. Cleanup completes successfully
-        //
-        // This fix is essential for MQTT DISCONNECT packet handling and any
-        // other error path that bypasses the normal buffer return flow.
         self.events_tx
             .send_async(IOEvent::ConnectionCleanup)
             .await
             .unwrap();
 
-        match method {
-            // Collect inflight bufers and drop inflight data
-            CleanupMethod::Terminate => {
-                // Wait for buffer to be returned from IO after cleanup
-                self.connection_to_io.recycler.recv_async().await;
-            }
-            // Collect inflight bufers and send inflight data to IO and client
-            CleanupMethod::Graceful => {
-                // Wait for buffer to be returned from IO after cleanup
-                self.connection_to_io.recycler.recv_async().await;
-                let standby = self.connection_to_io.recycler.standby().unwrap();
-                let _ = stream.write_all(standby).await;
+        self.connection_to_io.recycler.recv_async().await;
+        let standby = self.connection_to_io.recycler.standby().unwrap();
+        let _ = stream.write_all(standby).await;
 
-                // forward active buffer incase there is still some data.
-                //
-                // because, on EoF, we return error but some data might
-                // already be there in buffer. Hence, forward it first,
-                // then handle rest.
-                if self.connection_to_io.try_forward() {
-                    self.events_tx
-                        .send_async(IOEvent::ConnectionData)
-                        .await
-                        .unwrap();
-                }
-
-                // wait for acks again from previous exchange
-                // and write acks to client
-                self.connection_to_io.recycler.recv_async().await;
-                let standby = self.connection_to_io.recycler.standby().unwrap();
-                let _ = stream.write_all(standby).await;
-            }
-        };
-
-        // Collect any inflight buffer from io_to_connection pipe
-        // and return it back to IO via recycler
-        // But don't send IOEvent::OutgoingDataAck to keep io inert and not send data via outgoinghub
-        // At the end, outgoinghub.cleanup_connection() will collect the buffer back via recycler
-        if let Ok(mut buffer) = self.io_to_connection.try_recv() {
-            buffer.clear();
-            self.io_to_connection.ack(buffer);
+        // forward active buffer incase there is still some data.
+        if self.connection_to_io.try_forward() {
+            self.events_tx
+                .send_async(IOEvent::ConnectionData)
+                .await
+                .unwrap();
         }
 
-        // Wait for CleanupAck from IO to complete the cleanup flow
-        let event = self.control_rx.recv_async().await.unwrap();
-        debug_assert!(matches!(event, Control::CleanupAck));
+        // wait for acks again from previous exchange and write acks to client
+        self.connection_to_io.recycler.recv_async().await;
+        let standby = self.connection_to_io.recycler.standby().unwrap();
+        let _ = stream.write_all(standby).await;
 
         self.connection_to_io.clear();
         self.active = false;
         self.control_rx.drain();
-    }
-
-    pub fn print_stats(&mut self) {
-        println!(
-            "Connection => active buffer: {}, standby buf: {:?}, max: {}",
-            self.connection_to_io.active.len(),
-            self.connection_to_io.recycler.standby().map(|b| b.len()),
-            self.connection_to_io.active.max_size()
-        )
+        self.events_tx.send(IOEvent::ConnectionTerminated).unwrap();
     }
 }
 

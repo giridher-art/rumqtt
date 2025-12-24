@@ -28,6 +28,10 @@ pub enum Message {
     UnSubAck(UnSubscribeResp),
     // Disconnect
     Disconnect(Disconnect),
+    // Shutdown
+    Shutdown,
+    // Reconnecting
+    Reconnecting,
 }
 
 #[derive(Debug)]

@@ -160,6 +160,7 @@ use std::{marker::PhantomData, thread};
 use flume::Sender;
 use tokio::io::{AsyncRead, AsyncWrite};
 
+use crate::eventloop::ConnectionError;
 pub use crate::{
     client::{AsyncMode, Client, SyncMode},
     eventloop::Eventloop,
@@ -252,8 +253,13 @@ impl Router {
         self.logs.retain(|x| x.filter != filter);
     }
 
-    pub fn clear_logs(&mut self) {
-        self.logs.clear();
+    pub fn clear_logs(&mut self) -> Vec<Filter> {
+        let mut filters = Vec::new();
+        for log in self.logs.drain(..) {
+            let filter = Filter::new(log.filter, QoS::AtLeastOnce);
+            filters.push(filter);
+        }
+        filters
     }
 
     pub fn publish(&mut self, packet: Publish) {
@@ -287,22 +293,26 @@ impl Router {
             let _ = client.acks_channel.send(msg);
         }
     }
+
+    pub fn shutdown(&mut self) {
+        for client in self.clients.iter() {
+            let _ = client.acks_channel.send(Message::Shutdown);
+        }
+        self.logs.clear();
+        self.clients.clear();
+    }
+
+    pub fn reconnecting(&self) {
+        for client in self.clients.iter() {
+            client.acks_channel.send(Message::Reconnecting);
+        }
+    }
 }
 
 #[derive(Debug)]
 pub enum Control {
     Terminate,
-    CleanupAck,
-    Stats,
-}
-
-// used to let cleanup method know
-// how to perform the cleanup
-pub enum CleanupMethod {
-    // do normal cleanup
-    Graceful,
-    // timed-out, no need for cleanup
-    Terminate,
+    Cleanup,
 }
 
 // Represents all the IO/EventLoop events
@@ -310,10 +320,8 @@ pub enum CleanupMethod {
 pub enum IOEvent {
     // Connection data
     ConnectionData,
-
-    // Connection Terminated
+    // conneciton terminated
     ConnectionTerminated,
-
     // keep_alive
     Refresh,
 
@@ -325,7 +333,8 @@ pub enum IOEvent {
 
     // Client Data
     ClientMessage(Message),
-
+    // Mock error
+    MockError,
     // Shutdowning the eventloop
     Shutdown,
 }

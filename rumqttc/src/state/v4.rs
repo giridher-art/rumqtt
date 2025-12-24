@@ -53,6 +53,8 @@ pub struct OutgoingPacket {
 // Any missing acks from the broker are detected during the next recycled use of packet ids
 #[derive(Debug)]
 pub struct MqttState<P: Protocol> {
+    // Active
+    pub active: bool,
     /// Connection handle
     pub connection_handle: ConnectionHandle<P>,
     /// Status of last ping
@@ -85,8 +87,12 @@ pub struct MqttState<P: Protocol> {
     pub manual_acks: bool,
     // Packets
     pub packets: Vec<Incoming>,
+    // pending outgoing packets
+    pub pending: Vec<OutgoingPacket>,
     // Router
     pub router: Router,
+    // clean session
+    pub clean_session: bool,
 }
 
 impl<P: Protocol> MqttState<P> {
@@ -98,8 +104,10 @@ impl<P: Protocol> MqttState<P> {
         manual_acks: bool,
         connection_handle: ConnectionHandle<P>,
         clients: Vec<ClientState>,
+        clean_session: bool,
     ) -> Self {
         MqttState {
+            active: false,
             connection_handle,
             await_pingresp: false,
             collision_ping_count: 0,
@@ -116,51 +124,77 @@ impl<P: Protocol> MqttState<P> {
             outgoing_packet: vec![None; max_inflight as usize + 1],
             collision: None,
             manual_acks,
+            pending: Vec::new(),
             router: Router::new(clients),
+            clean_session,
         }
     }
 
-    pub fn read_incoming(&mut self) {
+    pub fn read_incoming(&mut self) -> Result<(), StateError> {
         if let Ok(()) = self.connection_handle.read_packets(&mut self.packets) {
             let packets = self.packets.drain(..).collect::<Vec<_>>();
-            println!("Received packets : {:?}", packets);
             for packet in packets {
-                self.handle_incoming_packet(packet);
+                println!("Incoming Packet: {:?}", packet);
+                self.handle_incoming_packet(packet)?;
             }
         }
+        Ok(())
+    }
+
+    pub fn send_cleanup(&mut self) {
+        self.connection_handle.send_cleanup();
     }
 
     // Implement clean for according to new architecture of the connection
-    /// Returns inflight outgoing packets and clears internal queues
-    // fn clean(&mut self)  {
-    //     let mut pending = Vec::with_capacity(100);
-    //     let (first_half, second_half) = self
-    //         .outgoing_pub
-    //         .split_at_mut(self.last_puback as usize + 1);
+    // / Returns inflight outgoing packets and clears internal queues
+    pub fn clean(&mut self) {
+        self.active = false;
+        self.connection_handle.clean();
 
-    //     for publish in second_half.iter_mut().chain(first_half) {
-    //         if let Some(publish) = publish.take() {
-    //             let request = ::Publish(publish);
-    //             pending.push(request);
-    //         }
-    //     }
+        for outgoing in self.outgoing_packet.iter_mut() {
+            if let Some(packet) = outgoing.take() {
+                self.pending.push(packet);
+            }
+        }
+        if let Some((_, outgoing)) = self.collision.take() {
+            self.pending.push(outgoing);
+        }
 
-    //     // remove and collect pending releases
-    //     for pkid in self.outgoing_rel.ones() {
-    //         let request = Request::PubRel(PubRel::new(pkid as u16));
-    //         pending.push(request);
-    //     }
-    //     self.outgoing_rel.clear();
+        if self.clean_session {
+            self.await_pingresp = false;
+            self.collision_ping_count = 0;
+            self.inflight = 0;
+            self.router.clear_logs();
+            self.last_ack = 0;
+            self.last_pkid = 0;
+            self.incoming_pub.clear();
+            self.outgoing_rel.clear();
+        }
+    }
+    pub fn resend_pending(&mut self) {
+        let pending_packets = self.pending.drain(..).collect::<Vec<_>>();
+        for packet in pending_packets {
+            let msg = match packet.packet {
+                Packet::Publish(publish) => Message::Publish(PublishReq {
+                    token_id: packet.token_id,
+                    publish,
+                }),
+                Packet::Subscribe(sub) => Message::Subscribe(SubscribeReq {
+                    token_id: packet.token_id,
+                    subscribe: sub,
+                }),
+                Packet::Unsubscribe(unsub) => Message::UnSub(UnSubscribeReq {
+                    token_id: packet.token_id,
+                    unsub,
+                }),
+                _ => {
+                    unimplemented!()
+                }
+            };
 
-    //     // remove packet ids of incoming qos2 publishes
-    //     self.incoming_pub.clear();
-
-    //     self.await_pingresp = false;
-    //     self.collision_ping_count = 0;
-    //     self.inflight = 0;
-    //     pending
-    // }
-
+            self.handle_outgoing_packet(packet.client_id, msg);
+        }
+    }
     fn inflight(&self) -> u16 {
         self.inflight
     }
@@ -172,6 +206,9 @@ impl<P: Protocol> MqttState<P> {
         client_id: usize,
         message: Message,
     ) -> Result<(), StateError> {
+        if !self.active {
+            return Ok(());
+        }
         let packet = match message {
             Message::Publish(pubreq) => self.outgoing_publish(client_id, pubreq),
             Message::Ping => self.outgoing_ping(),
@@ -763,7 +800,7 @@ mod test {
         let event_rx: EventsRx<IOEvent> = EventsRx::new(128);
         let event_tx = event_rx.producer(0);
         let (connection, _) = ConnectionHandle::new(event_tx, 1024, 1024);
-        MqttState::new(100 as u16, false, connection, Vec::new())
+        MqttState::new(100 as u16, false, connection, Vec::new(), true)
     }
 
     #[test]

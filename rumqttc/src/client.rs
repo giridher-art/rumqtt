@@ -1,18 +1,17 @@
 use std::{marker::PhantomData, sync::Arc};
 
-use flume::{IntoIter, Iter, Receiver, RecvError, SendError, TrySendError, r#async::RecvStream};
-use futures_util::{StreamExt, future::ok};
+use flume::{r#async::RecvStream, IntoIter, Iter, Receiver, RecvError, SendError, TrySendError};
+use futures_util::{future::ok, StreamExt};
 use tokio_rustls::client;
 
 use crate::{
-    Disconnect, Filter, IOEvent, Message, PubAck, PubRec, Publish, PublishReq, QoS, Subscribe,
-    SubscribeReq, UnSubscribeReq, Unsubscribe,
     events::{EventError, EventsTx},
     protocol::{
+        v4::{subscribe, V4},
         Protocol,
-        v4::{V4, subscribe},
     },
-    valid_filter, valid_topic,
+    valid_filter, valid_topic, Disconnect, Filter, IOEvent, Message, PubAck, PubRec, Publish,
+    PublishReq, QoS, Subscribe, SubscribeReq, UnSubscribeReq, Unsubscribe,
 };
 
 use bytes::Bytes;
@@ -52,7 +51,7 @@ pub struct Client<P: Protocol, M> {
     pub id: usize,
     protocol: P,
     token_id: usize,
-    event_tx: EventsTx<IOEvent>,
+    pub event_tx: EventsTx<IOEvent>,
     acks_receiver: Receiver<Message>,
     subcriptions_chan: Receiver<Publish>,
     _maker: PhantomData<M>,
@@ -211,15 +210,9 @@ impl<P: Protocol, M> Client<P, M> {
         Ok(token_id)
     }
 
-    /// Attempts to send a MQTT disconnect to the `EventLoop`
-    pub fn try_disconnect(&mut self) -> Result<(), ClientError> {
-        let disconnect = Disconnect {
-            reason_code: crate::DisconnectReasonCode::NormalDisconnection,
-            properties: None,
-        };
-
-        self.event_tx
-            .try_send(IOEvent::ClientMessage(Message::Disconnect(disconnect)))?;
+    // try disconnect
+    pub fn try_disconnect(&self) -> Result<(), ClientError> {
+        self.event_tx.try_send(IOEvent::Shutdown)?;
         Ok(())
     }
 }
@@ -357,13 +350,7 @@ impl Client<V4, SyncMode> {
 
     /// Sends a MQTT disconnect to the `EventLoop`
     pub fn disconnect(&mut self) -> Result<(), ClientError> {
-        let disconnect = Disconnect {
-            reason_code: crate::DisconnectReasonCode::NormalDisconnection,
-            properties: None,
-        };
-
-        self.event_tx
-            .send(IOEvent::ClientMessage(Message::Disconnect(disconnect)))?;
+        self.event_tx.send(IOEvent::Shutdown)?;
         Ok(())
     }
 }
@@ -513,14 +500,7 @@ impl Client<V4, AsyncMode> {
 
     /// Sends a MQTT disconnect to the `EventLoop`
     pub async fn disconnect(&self) -> Result<(), ClientError> {
-        let disconnect = Disconnect {
-            reason_code: crate::DisconnectReasonCode::NormalDisconnection,
-            properties: None,
-        };
-
-        self.event_tx
-            .send_async(IOEvent::ClientMessage(Message::Disconnect(disconnect)))
-            .await?;
+        self.event_tx.send_async(IOEvent::Shutdown).await?;
         Ok(())
     }
 }

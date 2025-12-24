@@ -194,3 +194,54 @@ fn test_publish_to_internal_clients() {
         _ => panic!("Unexpected message {:?}", msg),
     }
 }
+
+#[test]
+fn test_client_disconnect() {
+    let mut options = MqttOptions::new("client5", "localhost", 1883);
+    options.set_keep_alive(Duration::from_secs(3));
+    options.set_clean_session(true);
+    let mut clients = ClientBuilder::new(SyncMode, options, NetworkOptions::new())
+        .with_clients(1)
+        .build();
+    let mut client = clients.pop().unwrap();
+    let tokenid1 = client.publish("hello", rumqttc::QoS::AtLeastOnce, false, b"hello world");
+    let msg = client.wait().unwrap();
+    match msg {
+        Message::PublishAck(puback) => {
+            assert_eq!(puback.token_id, tokenid1);
+        }
+        _ => panic!("Unexpected message {:?}", msg),
+    }
+    client.disconnect().unwrap();
+    let msg = client.wait().unwrap();
+    match msg {
+        Message::Shutdown => {
+            println!("Client disconnected successfully");
+            assert!(true);
+        }
+        _ => {
+            panic!("Unexpected message {:?}", msg);
+        }
+    }
+}
+
+#[test]
+fn test_clean() {
+    let mut options = MqttOptions::new("client6", "localhost", 1883);
+    options.set_keep_alive(Duration::from_secs(3));
+    options.set_clean_session(true);
+    let mut clients = ClientBuilder::new(SyncMode, options, NetworkOptions::new())
+        .with_clients(1)
+        .build();
+    let mut client = clients.pop().unwrap();
+    let tokenid1 = client.publish("hello", rumqttc::QoS::AtLeastOnce, false, b"hello world");
+
+    client.event_tx.send(rumqttc::IOEvent::MockError).unwrap();
+    let msg = client.wait().unwrap();
+    match msg {
+        Message::PublishAck(puback) => {
+            assert_eq!(puback.token_id, tokenid1);
+        }
+        _ => panic!("Unexpected message {:?}", msg),
+    }
+}
