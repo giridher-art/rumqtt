@@ -53,25 +53,28 @@ impl Connection {
         &mut self,
         mut stream: &mut Box<dyn AsyncReadWrite>,
     ) -> Result<(), ConnectionError> {
+        self.events_tx
+            .send_async(IOEvent::NewConnection)
+            .await
+            .unwrap();
         loop {
             // TODO(swanx): we shall improve these names!!
             let has_space = self.connection_to_io.active.remaining_space() > 0;
             let (buffer, size) = self.connection_to_io.active.raw_mut();
             self.active = true;
 
-            let res: Result<(), ConnectionError> = select! {
+            select! {
                 // Read from network and fill read buffer
                 v = read_from_stream(buffer, &mut stream), if has_space  => {
                     if let Err(e) = v{
-                        Err(ConnectionError::Io(e))
-                    } else {
-                        *size += v.unwrap();
-                        // dbg!(_n);
-                        if self.connection_to_io.try_forward() {
-                            self.events_tx.send_async(IOEvent::ConnectionData).await.unwrap();
-                        }
-                        Ok(())
+                        return Err(ConnectionError::Io(e))
                     }
+                    *size += v.unwrap();
+                    // dbg!(_n);
+                    if self.connection_to_io.try_forward() {
+                        self.events_tx.send_async(IOEvent::ConnectionData).await.unwrap();
+                    }
+
                 }
                 _ = self.connection_to_io.recycler.wait() => {
                     // dbg!("received back incoming_tx buffer");
@@ -83,14 +86,10 @@ impl Connection {
                             if self.connection_to_io.try_forward() {
                                 self.events_tx.send_async(IOEvent::ConnectionData).await.unwrap();
                             }
-                            Ok(())
                         }
-                        Ok(Err(io_err)) => Err(ConnectionError::Io(io_err)),
-                        Err(_elapsed) => {
-                            Err(ConnectionError::NetworkTimeout)
-                        }
+                        Ok(Err(io_err)) => return  Err(ConnectionError::Io(io_err)),
+                        Err(_elapsed) => return Err(ConnectionError::NetworkTimeout),
                     }
-
 
                 }
 
@@ -101,29 +100,21 @@ impl Connection {
                             data.clear();
                             self.io_to_connection.ack(data);
                             self.events_tx.send_async(IOEvent::OutgoingDataAck).await.unwrap();
-                            Ok(())
                         }
-                        Ok(Err(io_err)) => Err(ConnectionError::Io(io_err)),
-                        Err(_elapsed) => {
-                            Err(ConnectionError::NetworkTimeout)
-                        }
+                        Ok(Err(io_err)) => return Err(ConnectionError::Io(io_err)),
+                        Err(_elapsed) => return Err(ConnectionError::NetworkTimeout),
+
                     }
                 }
                 signal = self.control_rx.recv_async() => {
                     match signal.expect("should recv") {
                         Control::Terminate => return Ok(()),
-                        Control::Cleanup => Err(ConnectionError::RequestsDone),
+                        Control::Cleanup => return Err(ConnectionError::RequestsDone),
 
                     }
                 }
-            };
-            if let Err(e) = res {
-                self.cleanup(stream).await;
-                return Err(e);
             }
         }
-
-        Ok(())
     }
 
     pub async fn cleanup(&mut self, stream: &mut Box<dyn AsyncReadWrite>) {
@@ -159,7 +150,6 @@ impl Connection {
         self.connection_to_io.clear();
         self.active = false;
         self.control_rx.drain();
-        self.events_tx.send(IOEvent::ConnectionTerminated).unwrap();
     }
 }
 

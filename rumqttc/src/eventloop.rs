@@ -125,7 +125,7 @@ pub struct Eventloop<P: Protocol> {
     pub state: MqttState<P>,
     //network options
     pub network_options: NetworkOptions,
-    // joinhandle for connection task
+    // Connection Handle
     pub connection_handle: Option<JoinHandle<(Connection, Network)>>,
 }
 
@@ -169,33 +169,23 @@ impl<P: Protocol> Eventloop<P> {
         options: &MqttOptions,
         network_options: &NetworkOptions,
     ) -> Result<(), ConnectionError> {
-        let mut network = connect(&self.mqtt_options, &self.network_options).await?;
-
         if let Some(mut connection) = self.connection.take() {
+            let options = self.mqtt_options.clone();
+            let mut network_options = network_options.clone();
             let handle = tokio::spawn(async move {
-                if let Err(e) = connection.start(&mut network.stream).await {
-                    println!("Connection error: {:?}", e);
+                loop {
+                    let mut network = connect(&options, &network_options)
+                        .await
+                        .expect("network connect");
+                    if let Err(e) = connection.start(&mut network.stream).await {
+                        connection.cleanup(&mut network.stream).await;
+                        println!("Connection error: {:?}", e);
+                    } else {
+                        return (connection, network);
+                    }
                 }
-                (connection, network)
             });
             self.connection_handle = Some(handle);
-        }
-        Ok(())
-    }
-
-    async fn reconnect(&mut self) -> Result<(), ConnectionError> {
-        if let Some(handle) = self.connection_handle.take() {
-            if let Ok((mut connection, _)) = handle.await {
-                let mut network =
-                    connect(&mut self.mqtt_options, &self.network_options.clone()).await?;
-                let handle = tokio::spawn(async move {
-                    if let Err(e) = connection.start(&mut network.stream).await {
-                        println!("Connection error: {:?}", e);
-                    }
-                    (connection, network)
-                });
-                self.connection_handle = Some(handle);
-            }
         }
         Ok(())
     }
@@ -213,8 +203,13 @@ impl<P: Protocol> Eventloop<P> {
             .await;
         self.state.active = true;
         while let Some((source_id, event)) = self.event_rx.next().await {
-            println!("Event :{:?}", event);
             let res = match event {
+                IOEvent::NewConnection => {
+                    self.state.active = true;
+                    self.state.resend_pending();
+                    println!("Network is reconnected");
+                    Ok(())
+                }
                 IOEvent::ConnectionData => {
                     if let Err(e) = self.state.read_incoming() {
                         Err(ConnectionError::MqttState(e))
@@ -224,16 +219,11 @@ impl<P: Protocol> Eventloop<P> {
                 }
                 IOEvent::ConnectionCleanup => {
                     self.state.clean();
-                    println!("state is cleaned uo");
+                    self.state.router.reconnecting();
+                    println!("state is cleaned up");
                     Ok(())
                 }
-                IOEvent::ConnectionTerminated => {
-                    self.reconnect().await?;
-                    self.state.active = true;
-                    self.state.resend_pending();
-                    println!("Network is reconnected");
-                    Ok(())
-                }
+
                 IOEvent::Refresh => {
                     self.event_rx
                         .reset_timer(self.mqtt_options.keep_alive.clone());

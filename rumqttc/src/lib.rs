@@ -324,10 +324,10 @@ pub enum Control {
 // Represents all the IO/EventLoop events
 #[derive(Debug)]
 pub enum IOEvent {
+    // New connection established
+    NewConnection,
     // Connection data
     ConnectionData,
-    // conneciton terminated
-    ConnectionTerminated,
     // keep_alive
     Refresh,
 
