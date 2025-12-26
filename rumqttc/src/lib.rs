@@ -9,23 +9,29 @@
 //! ----------------------------
 //!
 //! ```no_run
-//! use rumqttc::{MqttOptions, Client, QoS};
+//! use rumqttc::{MqttOptions, Client, QoS , ClientBuilder, SyncMode, NetworkOptions  , V4};
 //! use std::time::Duration;
 //! use std::thread;
 //!
-//! let mut mqttoptions = MqttOptions::new("rumqtt-sync", "test.mosquitto.org", 1883);
-//! mqttoptions.set_keep_alive(Duration::from_secs(5));
+//! fn main() {
+//!     let mut mqttoptions = MqttOptions::new("rumqtt-sync", "test.mosquitto.org", 1883);
+//!     mqttoptions.set_keep_alive(Duration::from_secs(5));
 //!
-//! let (mut client, mut connection) = Client::new(mqttoptions, 10);
-//! client.subscribe("hello/rumqtt", QoS::AtMostOnce).unwrap();
-//! thread::spawn(move || for i in 0..10 {
-//!    client.publish("hello/rumqtt", QoS::AtLeastOnce, false, vec![i; i as usize]).unwrap();
-//!    thread::sleep(Duration::from_millis(100));
-//! });
+//!     let mut clients = ClientBuilder::new(SyncMode, mqttoptions, NetworkOptions::new()).build();
+//!     let mut  client:Client<V4 , SyncMode> = clients.pop().unwrap();
+//!     let token_id = client.subscribe("hello/rumqtt", QoS::AtMostOnce).unwrap();
+// !      wait for SubscribeAck
+//!     let notification = client.wait().unwrap();
+//!     println!("Received = {:?}", notification);
+//!     client.publish("hello/rumqtt", QoS::AtLeastOnce, false, b"hello world!");
+// !     wait for PublishAck
+//!     let notification = client.wait().unwrap();
 //!
-//! // Iterate to poll the eventloop for connection progress
-//! for (i, notification) in connection.iter().enumerate() {
-//!     println!("Notification = {:?}", notification);
+// !     listen for incoming publishes
+//!     loop {
+//!         let notification = client.next().unwrap();
+//!         println!("Received = {:?}", notification);
+//!     }
 //! }
 //! ```
 //!
@@ -33,31 +39,31 @@
 //! ------------------------------
 //!
 //! ```no_run
-//! use rumqttc::{MqttOptions, AsyncClient, QoS};
-//! use tokio::{task, time};
+//! use rumqttc::{MqttOptions, Client, QoS , ClientBuilder, AsyncMode, NetworkOptions, V4};
 //! use std::time::Duration;
-//! use std::error::Error;
+//! use std::thread;
 //!
-//! # #[tokio::main(flavor = "current_thread")]
-//! # async fn main() {
-//! let mut mqttoptions = MqttOptions::new("rumqtt-async", "test.mosquitto.org", 1883);
-//! mqttoptions.set_keep_alive(Duration::from_secs(5));
+//!  #[tokio::main(flavor = "current_thread")]
+//! async fn main() {
+//!     let mut mqttoptions = MqttOptions::new("rumqtt-sync", "test.mosquitto.org", 1883);
+//!     mqttoptions.set_keep_alive(Duration::from_secs(5));
 //!
-//! let (mut client, mut eventloop) = AsyncClient::new(mqttoptions, 10);
-//! client.subscribe("hello/rumqtt", QoS::AtMostOnce).await.unwrap();
-//!
-//! task::spawn(async move {
-//!     for i in 0..10 {
-//!         client.publish("hello/rumqtt", QoS::AtLeastOnce, false, vec![i; i as usize]).await.unwrap();
-//!         time::sleep(Duration::from_millis(100)).await;
-//!     }
-//! });
-//!
-//! loop {
-//!     let notification = eventloop.poll().await.unwrap();
+//!     let mut clients = ClientBuilder::new(AsyncMode, mqttoptions, NetworkOptions::new()).build();
+//!     let mut  client : Client<V4 , AsyncMode> = clients.pop().unwrap();
+//!     let token_id = client.subscribe("hello/rumqtt", QoS::AtMostOnce).await;
+// !    wait for SubscribeAck
+//!     let notification = client.wait().await.unwrap();
 //!     println!("Received = {:?}", notification);
+//!     client.publish("hello/rumqtt", QoS::AtLeastOnce, false, b"hello world!").await.unwrap();
+// !    wait for PublishAck
+//!     let notification = client.wait().await.unwrap();
+//!
+// !    listen for incoming publishes
+//!     loop {
+//!         let notification = client.next().await.unwrap();
+//!         println!("Received = {:?}", notification);
+//!     }
 //! }
-//! # }
 //! ```
 //!
 //! Quick overview of features

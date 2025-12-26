@@ -207,6 +207,30 @@ impl<P: Protocol> MqttState<P> {
         message: Message,
     ) -> Result<(), StateError> {
         if !self.active {
+            match message {
+                Message::Publish(pubreq) => {
+                    self.pending.push(OutgoingPacket {
+                        client_id,
+                        token_id: pubreq.token_id,
+                        packet: Packet::Publish(pubreq.publish),
+                    });
+                }
+                Message::Subscribe(subreq) => {
+                    self.pending.push(OutgoingPacket {
+                        client_id,
+                        token_id: subreq.token_id,
+                        packet: Packet::Subscribe(subreq.subscribe),
+                    });
+                }
+                Message::UnSub(unsubreq) => {
+                    self.pending.push(OutgoingPacket {
+                        client_id,
+                        token_id: unsubreq.token_id,
+                        packet: Packet::Unsubscribe(unsubreq.unsub),
+                    });
+                }
+                _ => {}
+            }
             return Ok(());
         }
         let packet = match message {
