@@ -121,40 +121,42 @@ mod xchg;
 // mod state;
 // pub mod v5;
 
-// #[cfg(any(feature = "use-rustls-no-provider", feature = "use-native-tls"))]
-// mod tls;
+#[cfg(any(feature = "use-rustls-no-provider", feature = "use-native-tls"))]
+mod tls;
 
-// #[cfg(feature = "websocket")]
-// mod websockets;
+#[cfg(feature = "websocket")]
+mod websockets;
 
-// #[cfg(feature = "websocket")]
-// use std::{
-//     future::{Future, IntoFuture},
-//     pin::Pin,
-// };
+#[cfg(feature = "websocket")]
+use std::{
+    future::{Future, IntoFuture},
+    pin::Pin,
+};
 
-// #[cfg(feature = "websocket")]
-// type RequestModifierFn = Arc<
-//     dyn Fn(http::Request<()>) -> Pin<Box<dyn Future<Output = http::Request<()>> + Send>>
-//         + Send
-//         + Sync,
-// >;
+#[cfg(feature = "websocket")]
+type RequestModifierFn = Arc<
+    dyn Fn(http::Request<()>) -> Pin<Box<dyn Future<Output = http::Request<()>> + Send>>
+        + Send
+        + Sync,
+>;
 
-// #[cfg(feature = "proxy")]
-// mod proxy;
+#[cfg(feature = "proxy")]
+mod proxy;
+#[cfg(feature = "proxy")]
+use proxy::Proxy;
 
-// #[cfg(feature = "use-rustls-no-provider")]
-// use rustls_native_certs::load_native_certs;
-// #[cfg(any(feature = "use-rustls-no-provider", feature = "use-native-tls"))]
-// pub use tls::Error as TlsError;
-// #[cfg(feature = "use-native-tls")]
-// pub use tokio_native_tls;
-// #[cfg(feature = "use-native-tls")]
-// use tokio_native_tls::native_tls::TlsConnector;
-// #[cfg(feature = "use-rustls-no-provider")]
-// pub use tokio_rustls;
-// #[cfg(feature = "use-rustls-no-provider")]
-// use tokio_rustls::rustls::{ClientConfig, RootCertStore};
+#[cfg(feature = "use-rustls-no-provider")]
+use rustls_native_certs::load_native_certs;
+#[cfg(any(feature = "use-rustls-no-provider", feature = "use-native-tls"))]
+pub use tls::Error as TlsError;
+#[cfg(feature = "use-native-tls")]
+pub use tokio_native_tls;
+#[cfg(feature = "use-native-tls")]
+use tokio_native_tls::native_tls::TlsConnector;
+#[cfg(feature = "use-rustls-no-provider")]
+pub use tokio_rustls;
+#[cfg(feature = "use-rustls-no-provider")]
+use tokio_rustls::rustls::{ClientConfig, RootCertStore};
 
 // #[cfg(feature = "proxy")]
 // pub use proxy::{Proxy, ProxyAuth, ProxyType};
@@ -420,23 +422,29 @@ impl<T> AsyncReadWrite for T where T: AsyncRead + AsyncWrite + Send + Unpin {}
 pub struct Network {
     pub stream: Box<dyn AsyncReadWrite>,
 }
+
+impl Network {
+    pub fn new(stream: Box<dyn AsyncReadWrite>) -> Self {
+        Network { stream }
+    }
+}
 /// Transport methods. Defaults to TCP.
 #[derive(Clone)]
 pub enum Transport {
     Tcp,
-    // #[cfg(any(feature = "use-rustls-no-provider", feature = "use-native-tls"))]
-    // Tls(TlsConfiguration),
-    // #[cfg(unix)]
-    // Unix,
-    // #[cfg(feature = "websocket")]
-    // #[cfg_attr(docsrs, doc(cfg(feature = "websocket")))]
-    // Ws,
-    // #[cfg(all(feature = "use-rustls-no-provider", feature = "websocket"))]
-    // #[cfg_attr(
-    //     docsrs,
-    //     doc(cfg(all(feature = "use-rustls-no-provider", feature = "websocket")))
-    // )]
-    // Wss(TlsConfiguration),
+    #[cfg(any(feature = "use-rustls-no-provider", feature = "use-native-tls"))]
+    Tls(TlsConfiguration),
+    #[cfg(unix)]
+    Unix,
+    #[cfg(feature = "websocket")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "websocket")))]
+    Ws,
+    #[cfg(all(feature = "use-rustls-no-provider", feature = "websocket"))]
+    #[cfg_attr(
+        docsrs,
+        doc(cfg(all(feature = "use-rustls-no-provider", feature = "websocket")))
+    )]
+    Wss(TlsConfiguration),
 }
 
 impl Default for Transport {
@@ -451,143 +459,143 @@ impl Transport {
         Self::Tcp
     }
 
-    // #[cfg(feature = "use-rustls-no-provider")]
-    // pub fn tls_with_default_config() -> Self {
-    //     Self::tls_with_config(Default::default())
-    // }
+    #[cfg(feature = "use-rustls-no-provider")]
+    pub fn tls_with_default_config() -> Self {
+        Self::tls_with_config(Default::default())
+    }
 
-    // /// Use secure tcp with tls as transport
-    // #[cfg(feature = "use-rustls-no-provider")]
-    // pub fn tls(
-    //     ca: Vec<u8>,
-    //     client_auth: Option<(Vec<u8>, Vec<u8>)>,
-    //     alpn: Option<Vec<Vec<u8>>>,
-    // ) -> Self {
-    //     let config = TlsConfiguration::Simple {
-    //         ca,
-    //         alpn,
-    //         client_auth,
-    //     };
+    /// Use secure tcp with tls as transport
+    #[cfg(feature = "use-rustls-no-provider")]
+    pub fn tls(
+        ca: Vec<u8>,
+        client_auth: Option<(Vec<u8>, Vec<u8>)>,
+        alpn: Option<Vec<Vec<u8>>>,
+    ) -> Self {
+        let config = TlsConfiguration::Simple {
+            ca,
+            alpn,
+            client_auth,
+        };
 
-    //     Self::tls_with_config(config)
-    // }
+        Self::tls_with_config(config)
+    }
 
-    // #[cfg(any(feature = "use-rustls-no-provider", feature = "use-native-tls"))]
-    // pub fn tls_with_config(tls_config: TlsConfiguration) -> Self {
-    //     Self::Tls(tls_config)
-    // }
+    #[cfg(any(feature = "use-rustls-no-provider", feature = "use-native-tls"))]
+    pub fn tls_with_config(tls_config: TlsConfiguration) -> Self {
+        Self::Tls(tls_config)
+    }
 
-    // #[cfg(unix)]
-    // pub fn unix() -> Self {
-    //     Self::Unix
-    // }
+    #[cfg(unix)]
+    pub fn unix() -> Self {
+        Self::Unix
+    }
 
-    // /// Use websockets as transport
-    // #[cfg(feature = "websocket")]
-    // #[cfg_attr(docsrs, doc(cfg(feature = "websocket")))]
-    // pub fn ws() -> Self {
-    //     Self::Ws
-    // }
+    /// Use websockets as transport
+    #[cfg(feature = "websocket")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "websocket")))]
+    pub fn ws() -> Self {
+        Self::Ws
+    }
 
-    // /// Use secure websockets with tls as transport
-    // #[cfg(all(feature = "use-rustls-no-provider", feature = "websocket"))]
-    // #[cfg_attr(
-    //     docsrs,
-    //     doc(cfg(all(feature = "use-rustls-no-provider", feature = "websocket")))
-    // )]
-    // pub fn wss(
-    //     ca: Vec<u8>,
-    //     client_auth: Option<(Vec<u8>, Vec<u8>)>,
-    //     alpn: Option<Vec<Vec<u8>>>,
-    // ) -> Self {
-    //     let config = TlsConfiguration::Simple {
-    //         ca,
-    //         client_auth,
-    //         alpn,
-    //     };
+    /// Use secure websockets with tls as transport
+    #[cfg(all(feature = "use-rustls-no-provider", feature = "websocket"))]
+    #[cfg_attr(
+        docsrs,
+        doc(cfg(all(feature = "use-rustls-no-provider", feature = "websocket")))
+    )]
+    pub fn wss(
+        ca: Vec<u8>,
+        client_auth: Option<(Vec<u8>, Vec<u8>)>,
+        alpn: Option<Vec<Vec<u8>>>,
+    ) -> Self {
+        let config = TlsConfiguration::Simple {
+            ca,
+            client_auth,
+            alpn,
+        };
 
-    //     Self::wss_with_config(config)
-    // }
+        Self::wss_with_config(config)
+    }
 
-    // #[cfg(all(feature = "use-rustls-no-provider", feature = "websocket"))]
-    // #[cfg_attr(
-    //     docsrs,
-    //     doc(cfg(all(feature = "use-rustls-no-provider", feature = "websocket")))
-    // )]
-    // pub fn wss_with_config(tls_config: TlsConfiguration) -> Self {
-    //     Self::Wss(tls_config)
-    // }
+    #[cfg(all(feature = "use-rustls-no-provider", feature = "websocket"))]
+    #[cfg_attr(
+        docsrs,
+        doc(cfg(all(feature = "use-rustls-no-provider", feature = "websocket")))
+    )]
+    pub fn wss_with_config(tls_config: TlsConfiguration) -> Self {
+        Self::Wss(tls_config)
+    }
 
-    // #[cfg(all(feature = "use-rustls-no-provider", feature = "websocket"))]
-    // #[cfg_attr(
-    //     docsrs,
-    //     doc(cfg(all(feature = "use-rustls-no-provider", feature = "websocket")))
-    // )]
-    // pub fn wss_with_default_config() -> Self {
-    //     Self::Wss(Default::default())
-    // }
+    #[cfg(all(feature = "use-rustls-no-provider", feature = "websocket"))]
+    #[cfg_attr(
+        docsrs,
+        doc(cfg(all(feature = "use-rustls-no-provider", feature = "websocket")))
+    )]
+    pub fn wss_with_default_config() -> Self {
+        Self::Wss(Default::default())
+    }
 }
 
-/// TLS configuration method
-// #[derive(Clone, Debug)]
-// #[cfg(any(feature = "use-rustls-no-provider", feature = "use-native-tls"))]
-// pub enum TlsConfiguration {
-//     #[cfg(feature = "use-rustls-no-provider")]
-//     Simple {
-//         /// ca certificate
-//         ca: Vec<u8>,
-//         /// alpn settings
-//         alpn: Option<Vec<Vec<u8>>>,
-//         /// tls client_authentication
-//         client_auth: Option<(Vec<u8>, Vec<u8>)>,
-//     },
-//     #[cfg(feature = "use-native-tls")]
-//     SimpleNative {
-//         /// ca certificate
-//         ca: Vec<u8>,
-//         /// pkcs12 binary der and
-//         /// password for use with der
-//         client_auth: Option<(Vec<u8>, String)>,
-//     },
-//     #[cfg(feature = "use-rustls-no-provider")]
-//     /// Injected rustls ClientConfig for TLS, to allow more customisation.
-//     Rustls(Arc<ClientConfig>),
-//     #[cfg(feature = "use-native-tls")]
-//     /// Use default native-tls configuration
-//     Native,
-//     #[cfg(feature = "use-native-tls")]
-//     /// Injected native-tls TlsConnector for TLS, to allow more customisation.
-//     NativeConnector(TlsConnector),
-// }
+// TLS configuration method
+#[derive(Clone, Debug)]
+#[cfg(any(feature = "use-rustls-no-provider", feature = "use-native-tls"))]
+pub enum TlsConfiguration {
+    #[cfg(feature = "use-rustls-no-provider")]
+    Simple {
+        /// ca certificate
+        ca: Vec<u8>,
+        /// alpn settings
+        alpn: Option<Vec<Vec<u8>>>,
+        /// tls client_authentication
+        client_auth: Option<(Vec<u8>, Vec<u8>)>,
+    },
+    #[cfg(feature = "use-native-tls")]
+    SimpleNative {
+        /// ca certificate
+        ca: Vec<u8>,
+        /// pkcs12 binary der and
+        /// password for use with der
+        client_auth: Option<(Vec<u8>, String)>,
+    },
+    #[cfg(feature = "use-rustls-no-provider")]
+    /// Injected rustls ClientConfig for TLS, to allow more customisation.
+    Rustls(Arc<ClientConfig>),
+    #[cfg(feature = "use-native-tls")]
+    /// Use default native-tls configuration
+    Native,
+    #[cfg(feature = "use-native-tls")]
+    /// Injected native-tls TlsConnector for TLS, to allow more customisation.
+    NativeConnector(TlsConnector),
+}
 
-// #[cfg(feature = "use-rustls-no-provider")]
-// impl Default for TlsConfiguration {
-//     fn default() -> Self {
-//         let mut root_cert_store = RootCertStore::empty();
-//         for cert in load_native_certs().expect("could not load platform certs") {
-//             root_cert_store.add(cert).unwrap();
-//         }
-//         let tls_config = ClientConfig::builder()
-//             .with_root_certificates(root_cert_store)
-//             .with_no_client_auth();
+#[cfg(feature = "use-rustls-no-provider")]
+impl Default for TlsConfiguration {
+    fn default() -> Self {
+        let mut root_cert_store = RootCertStore::empty();
+        for cert in load_native_certs().expect("could not load platform certs") {
+            root_cert_store.add(cert).unwrap();
+        }
+        let tls_config = ClientConfig::builder()
+            .with_root_certificates(root_cert_store)
+            .with_no_client_auth();
 
-//         Self::Rustls(Arc::new(tls_config))
-//     }
-// }
+        Self::Rustls(Arc::new(tls_config))
+    }
+}
 
-// #[cfg(feature = "use-rustls-no-provider")]
-// impl From<ClientConfig> for TlsConfiguration {
-//     fn from(config: ClientConfig) -> Self {
-//         TlsConfiguration::Rustls(Arc::new(config))
-//     }
-// }
+#[cfg(feature = "use-rustls-no-provider")]
+impl From<ClientConfig> for TlsConfiguration {
+    fn from(config: ClientConfig) -> Self {
+        TlsConfiguration::Rustls(Arc::new(config))
+    }
+}
 
-// #[cfg(feature = "use-native-tls")]
-// impl From<TlsConnector> for TlsConfiguration {
-//     fn from(connector: TlsConnector) -> Self {
-//         TlsConfiguration::NativeConnector(connector)
-//     }
-// }
+#[cfg(feature = "use-native-tls")]
+impl From<TlsConnector> for TlsConfiguration {
+    fn from(connector: TlsConnector) -> Self {
+        TlsConfiguration::NativeConnector(connector)
+    }
+}
 
 /// Provides a way to configure low level network connection configurations
 #[derive(Clone, Default)]
@@ -916,36 +924,36 @@ impl MqttOptions {
         self.manual_acks
     }
 
-    // #[cfg(feature = "proxy")]
-    // pub fn set_proxy(&mut self, proxy: Proxy) -> &mut Self {
-    //     self.proxy = Some(proxy);
-    //     self
-    // }
+    #[cfg(feature = "proxy")]
+    pub fn set_proxy(&mut self, proxy: Proxy) -> &mut Self {
+        self.proxy = Some(proxy);
+        self
+    }
 
-    // #[cfg(feature = "proxy")]
-    // pub fn proxy(&self) -> Option<Proxy> {
-    //     self.proxy.clone()
-    // }
+    #[cfg(feature = "proxy")]
+    pub fn proxy(&self) -> Option<Proxy> {
+        self.proxy.clone()
+    }
 
-    // #[cfg(feature = "websocket")]
-    // pub fn set_request_modifier<F, O>(&mut self, request_modifier: F) -> &mut Self
-    // where
-    //     F: Fn(http::Request<()>) -> O + Send + Sync + 'static,
-    //     O: IntoFuture<Output = http::Request<()>> + 'static,
-    //     O::IntoFuture: Send,
-    // {
-    //     self.request_modifier = Some(Arc::new(move |request| {
-    //         let request_modifier = request_modifier(request).into_future();
-    //         Box::pin(request_modifier)
-    //     }));
+    #[cfg(feature = "websocket")]
+    pub fn set_request_modifier<F, O>(&mut self, request_modifier: F) -> &mut Self
+    where
+        F: Fn(http::Request<()>) -> O + Send + Sync + 'static,
+        O: IntoFuture<Output = http::Request<()>> + 'static,
+        O::IntoFuture: Send,
+    {
+        self.request_modifier = Some(Arc::new(move |request| {
+            let request_modifier = request_modifier(request).into_future();
+            Box::pin(request_modifier)
+        }));
 
-    //     self
-    // }
+        self
+    }
 
-    // #[cfg(feature = "websocket")]
-    // pub fn request_modifier(&self) -> Option<RequestModifierFn> {
-    //     self.request_modifier.clone()
-    // }
+    #[cfg(feature = "websocket")]
+    pub fn request_modifier(&self) -> Option<RequestModifierFn> {
+        self.request_modifier.clone()
+    }
 }
 
 #[cfg(feature = "url")]
